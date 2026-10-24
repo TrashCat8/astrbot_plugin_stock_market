@@ -88,4 +88,9 @@
 python tests/test_engine.py
 ```
 
-引擎层（`market/engine.py`）不依赖 AstrBot，单测直接跑。
+引擎层（`market/engine.py`）不依赖 AstrBot，单测直接跑。依赖 AstrBot 环境的用例（如名称表）在纯离线环境会打印 `SKIP` 并跳过，容器内冒烟测试会覆盖这部分。
+
+## 更新日志
+
+- **1.1.1**（2026-10-24）：按插件商店审核规范，日志记录器统一改为 `from astrbot.api import logger`；纯离线单测对依赖 AstrBot 的用例自动跳过。
+- **1.1.0**（2026-10-24）：新增杠杆玩法（倍数开仓、按日计息、自动强平、欠款优先偿还），指令 `融资买入` / `杠杆` / `还债`。
