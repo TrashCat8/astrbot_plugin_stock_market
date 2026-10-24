@@ -1,14 +1,15 @@
 name: astrbot_plugin_stock_market
 display_name: 群内模拟股市
-short_desc: 群友用虚拟资金炒股：行情、买卖、限价单、签到、排行榜
+short_desc: 群友用虚拟资金炒股：行情、买卖、杠杆、限价单、签到、排行榜
 desc: |
   群内模拟炒股：开户、行情、买入卖出、限价挂单、新闻与走势图，每个群独立账本，行情按固定间隔自动推进。
+  支持倍数开仓的杠杆玩法（保证金、按日计息、自动强平与欠款自动偿还）。
   另有签到、补助、资产排行、赚钱榜/亏钱榜，以及 db 赌博、抢劫、transfer 转账等玩法。
   卡片由 Pillow 本地渲染，不依赖外部文转图服务。
   本插件为 AI 辅助创作（由 Claude 协助编写、作者验收），详见仓库 README 的「AI 辅助创作说明」。
 author: TrashCat8
 repo: https://github.com/TrashCat8/astrbot_plugin_stock_market
-version: 1.0.4
+version: 1.1.0
 astrbot_version: ">=4.9.2"
 support_platforms:
   - aiocqhttp

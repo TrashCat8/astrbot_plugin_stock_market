@@ -30,6 +30,12 @@ ALIASES = {
     "持仓": "position",
     "买入": "buy",
     "卖出": "sell",
+    "融资买入": "margin_buy",
+    "杠杆买入": "margin_buy",
+    "杠杆": "leverage",
+    "负债": "leverage",
+    "还债": "repay",
+    "还款": "repay",
     "买单": "limit_buy",
     "卖单": "limit_sell",
     "挂单": "orders",
@@ -57,6 +63,9 @@ NEED_ACCOUNT = "你还没有开户，请先发送「/股市 开户」。"
 USAGE = {
     "买入": "用法：/股市 买入 ST001 100",
     "卖出": "用法：/股市 卖出 ST001 100",
+    "融资买入": "用法：/股市 融资买入 ST001 100 2（2 倍杠杆）",
+    "杠杆": "用法：/股市 杠杆（查看欠款与强平价）",
+    "还债": "用法：/股市 还债 [金额]，不填金额表示全部还清",
     "买单": "用法：/股市 买单 ST001 100 9.50",
     "卖单": "用法：/股市 卖单 ST001 100 12.00",
     "撤单": "用法：/股市 撤单 1",
@@ -208,6 +217,14 @@ class StockMarketPlugin(Star):
     def _card_ok(self, cfg: Config) -> bool:
         return cfg.render_cards
 
+    def _with_notes(
+        self, event: AstrMessageEvent, notes: list[str], result
+    ) -> list[Any] | Any:
+        """把强平/计息通知放在正式结果前面一起发出。"""
+        if not notes:
+            return result
+        return [*(event.plain_result(note) for note in notes), result]
+
     def _image_or_text(self, event: AstrMessageEvent, path: Path, text: str):
         try:
             return event.image_result(str(path))
@@ -248,8 +265,12 @@ class StockMarketPlugin(Star):
             yield event.plain_result("股市服务出错了，请稍后再试。")
             return
 
-        if result is not None:
-            yield result
+        if result is None:
+            return
+        results = result if isinstance(result, (list, tuple)) else [result]
+        for item in results:
+            if item is not None:
+                yield item
 
     # ------------------------------------------------------------------ #
     # 各子指令
@@ -314,19 +335,20 @@ class StockMarketPlugin(Star):
             state = self._require(state)
             self._mark_name(event, state, user)
             summary = engine.account_summary(state, user)
+            notes = engine.pop_notices(engine.require_account(state, user))
             round_no = int(state["round"])
             updated = engine.fmt_time(time.time())
             text = textfmt.position_text(summary, round_no)
             out = self.store.cache_file(f"position_{namespace}_{round_no}.png")
 
         if not self._card_ok(cfg):
-            return event.plain_result(text)
+            return self._with_notes(event, notes, event.plain_result(text))
         try:
             render.render_position(summary, round_no, updated, out=out)
         except Exception:
             logger.exception("[stock] 持仓卡渲染失败，回退文字")
-            return event.plain_result(text)
-        return event.image_result(str(out))
+            return self._with_notes(event, notes, event.plain_result(text))
+        return self._with_notes(event, notes, event.image_result(str(out)))
 
     async def _cmd_buy(self, event, namespace, cfg, rest):
         if len(rest) < 2:
@@ -336,12 +358,15 @@ class StockMarketPlugin(Star):
             state = self._require(state)
             self._mark_name(event, state, user)
             trade = engine.buy(state, user, rest[0], rest[1], cfg)
-        return event.plain_result(
-            f"买入成功：{trade['label']} × {trade['shares']} 股\n"
+            notes = engine.pop_notices(engine.require_account(state, user))
+        lines = [
+            *notes,
+            f"买入成功：{trade['label']} × {trade['shares']} 股",
             f"成交价 {engine.fmt_money(trade['price'], comma=False)} 元，"
-            f"手续费 {engine.fmt_money(trade['fee'])} 元\n"
-            f"可用资金: {engine.fmt_money(trade['cash'])} 元"
-        )
+            f"手续费 {engine.fmt_money(trade['fee'])} 元",
+            f"可用资金: {engine.fmt_money(trade['cash'])} 元",
+        ]
+        return event.plain_result("\n".join(lines))
 
     async def _cmd_sell(self, event, namespace, cfg, rest):
         if len(rest) < 2:
@@ -351,14 +376,94 @@ class StockMarketPlugin(Star):
             state = self._require(state)
             self._mark_name(event, state, user)
             trade = engine.sell(state, user, rest[0], rest[1], cfg)
-        return event.plain_result(
-            f"卖出成功：{trade['label']} × {trade['shares']} 股\n"
+            notes = engine.pop_notices(engine.require_account(state, user))
+        lines = [
+            *notes,
+            f"卖出成功：{trade['label']} × {trade['shares']} 股",
             f"成交价 {engine.fmt_money(trade['price'], comma=False)} 元，"
-            f"手续费 {engine.fmt_money(trade['fee'])} 元\n"
+            f"手续费 {engine.fmt_money(trade['fee'])} 元",
             f"到账 {engine.fmt_money(trade['proceeds'])} 元，"
-            f"本次盈亏 {engine.fmt_money(trade['realized'])} 元\n"
-            f"可用资金: {engine.fmt_money(trade['cash'])} 元"
+            f"本次盈亏 {engine.fmt_money(trade['realized'])} 元",
+        ]
+        if trade.get("repaid"):
+            lines.append(f"偿还欠款 {engine.fmt_money(trade['repaid'])} 元")
+        if trade.get("debt"):
+            lines.append(f"剩余欠款 {engine.fmt_money(trade['debt'])} 元")
+        lines.append(f"可用资金: {engine.fmt_money(trade['cash'])} 元")
+        return event.plain_result("\n".join(lines))
+
+    async def _cmd_margin_buy(self, event, namespace, cfg, rest):
+        if len(rest) < 3:
+            raise MarketError(USAGE["融资买入"])
+        user = self._user(event)
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            self._mark_name(event, state, user)
+            trade = engine.leverage_buy(state, user, rest[0], rest[1], rest[2], cfg)
+            notes = engine.pop_notices(engine.require_account(state, user))
+        lines = [
+            *notes,
+            f"融资买入成功：{trade['label']} × {trade['shares']} 股"
+            f"（{trade['leverage']:g} 倍）",
+            f"成交价 {engine.fmt_money(trade['price'], comma=False)} 元，"
+            f"手续费 {engine.fmt_money(trade['fee'])} 元",
+            f"自有保证金 {engine.fmt_money(trade['margin'])} 元，"
+            f"系统垫付 {engine.fmt_money(trade['borrowed'])} 元",
+            f"当前欠款 {engine.fmt_money(trade['debt'])} 元，"
+            f"可用资金 {engine.fmt_money(trade['cash'])} 元",
+            "发送「/股市 杠杆」查看强平价；欠款按天计息，还清前不能再融资。",
+        ]
+        return event.plain_result("\n".join(lines))
+
+    async def _cmd_leverage(self, event, namespace, cfg, rest):
+        user = self._user(event)
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            self._mark_name(event, state, user)
+            info = engine.leverage_info(state, user, cfg)
+            notes = engine.pop_notices(engine.require_account(state, user))
+
+        lines = [
+            *notes,
+            "【杠杆账户】",
+            f"可用 {engine.fmt_money(info['cash'])} 元 · "
+            f"总资产 {engine.fmt_money(info['total'])} 元 · "
+            f"欠款 {engine.fmt_money(info['debt'])} 元",
+            f"净资产 {engine.fmt_money(info['net'])} 元 · "
+            f"最高 {info['max_leverage']:g} 倍 · "
+            f"日息 {info['daily_rate'] * 100:.3f}%",
+        ]
+        if not info["positions"]:
+            lines.append("没有杠杆持仓。用法：/股市 融资买入 ST001 100 2")
+        for row in info["positions"]:
+            lines.append(
+                f"{row['label']}：{row['shares']} 股，欠款 {engine.fmt_money(row['debt'])} 元"
+            )
+            lines.append(
+                f"  市值 {engine.fmt_money(row['value'])} 元 · "
+                f"权益比 {row['ratio']:.1f}% · "
+                f"强平价 {engine.fmt_money(row['liq_price'], comma=False)} 元"
+            )
+        lines.append(
+            f"权益/市值低于 {info['call_ratio'] * 100:.0f}% 时自动强平；"
+            "强平后仍欠的钱会保留，后续收入优先还债。"
         )
+        return event.plain_result("\n".join(lines))
+
+    async def _cmd_repay(self, event, namespace, cfg, rest):
+        user = self._user(event)
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            self._mark_name(event, state, user)
+            info = engine.repay_debt(state, user, rest[0] if rest else "", cfg)
+            notes = engine.pop_notices(engine.require_account(state, user))
+        lines = [
+            *notes,
+            f"已还债 {engine.fmt_money(info['amount'])} 元",
+            f"剩余欠款 {engine.fmt_money(info['debt'])} 元，"
+            f"可用资金 {engine.fmt_money(info['cash'])} 元",
+        ]
+        return event.plain_result("\n".join(lines))
 
     async def _cmd_limit_buy(self, event, namespace, cfg, rest):
         return await self._place_limit(event, namespace, cfg, rest, "buy")
@@ -518,12 +623,17 @@ class StockMarketPlugin(Star):
             state = self._require(state)
             self._mark_name(event, state, user)
             info = engine.checkin(state, user, cfg)
+            notes = engine.pop_notices(engine.require_account(state, user))
 
-        lines = [f"签到成功！获得 {engine.fmt_money(info['amount'])} 元"]
+        lines = [*notes, f"签到成功！获得 {engine.fmt_money(info['amount'])} 元"]
         if info["streak"] > 1:
             lines.append(
                 f"连续签到 {info['streak']} 天，奖励加成 +{info['bonus_pct']:.0f}%"
             )
+        if info.get("repaid"):
+            lines.append(f"其中 {engine.fmt_money(info['repaid'])} 元自动还债")
+        if info.get("debt"):
+            lines.append(f"剩余欠款 {engine.fmt_money(info['debt'])} 元")
         lines.append(f"可用资金: {engine.fmt_money(info['cash'])} 元")
         return event.plain_result("\n".join(lines))
 
@@ -533,14 +643,23 @@ class StockMarketPlugin(Star):
             state = self._require(state)
             self._mark_name(event, state, user)
             info = engine.relief(state, user, cfg)
+            notes = engine.pop_notices(engine.require_account(state, user))
 
-        return event.plain_result(
-            f"补助到账：{engine.fmt_money(info['amount'])} 元\n"
-            f"补助前总资产 {engine.fmt_money(info['total_before'])} 元"
-            f"（低于 {engine.fmt_money(cfg.relief_threshold)} 元可领）\n"
+        lines = [
+            *notes,
+            f"补助到账：{engine.fmt_money(info['amount'])} 元",
+            f"补助前净资产 {engine.fmt_money(info['total_before'])} 元"
+            f"（低于 {engine.fmt_money(cfg.relief_threshold)} 元可领）",
+        ]
+        if info.get("repaid"):
+            lines.append(f"其中 {engine.fmt_money(info['repaid'])} 元自动还债")
+        if info.get("debt"):
+            lines.append(f"剩余欠款 {engine.fmt_money(info['debt'])} 元")
+        lines.append(
             f"下次可领需等 {cfg.relief_cooldown_hours} 小时，"
             f"可用资金: {engine.fmt_money(info['cash'])} 元"
         )
+        return event.plain_result("\n".join(lines))
 
     async def _cmd_rank(self, event, namespace, cfg, rest):
         limit = cfg.rank_size
@@ -625,15 +744,26 @@ class StockMarketPlugin(Star):
             if target_name:
                 engine.touch_name(state, target, target_name)
             info = engine.rob(state, user, target, cfg)
+            notes = engine.pop_notices(engine.require_account(state, user))
 
         who = target_name or target
         if info["success"]:
-            return event.plain_result(
-                f"抢劫成功！从 {who} 抢到 {engine.fmt_money(info['amount'])} 元\n"
-                f"成功率 {info['chance']:.0f}%，实际抢走 {info['pct']:.1f}%\n"
-                f"你的可用资金: {engine.fmt_money(info['cash'])} 元\n"
-                f"（{cfg.rob_cooldown_minutes} 分钟冷却中）"
+            lines = [
+                *notes,
+                f"抢劫成功！从 {who} 抢到 {engine.fmt_money(info['amount'])} 元",
+                f"成功率 {info['chance']:.0f}%，实际抢走 {info['pct']:.1f}%",
+            ]
+            if info.get("repaid"):
+                lines.append(f"其中 {engine.fmt_money(info['repaid'])} 元自动还债")
+            if info.get("debt"):
+                lines.append(f"剩余欠款 {engine.fmt_money(info['debt'])} 元")
+            lines.extend(
+                [
+                    f"你的可用资金: {engine.fmt_money(info['cash'])} 元",
+                    f"（{cfg.rob_cooldown_minutes} 分钟冷却中）",
+                ]
             )
+            return event.plain_result("\n".join(lines))
         if int(info["amount"]) <= 0:
             return event.plain_result(
                 f"抢劫失败！不过你也没钱可被反抢…（成功率 {info['chance']:.0f}%）\n"
@@ -658,11 +788,16 @@ class StockMarketPlugin(Star):
                 engine.touch_name(state, target, target_name)
             info = engine.transfer(state, user, target, amount, cfg)
 
-        return event.plain_result(
-            f"转账成功：{engine.fmt_money(info['amount'])} 元 → {info['target_name']}\n"
-            f"你的可用资金: {engine.fmt_money(info['cash'])} 元\n"
-            f"对方可用资金: {engine.fmt_money(info['target_cash'])} 元"
-        )
+        lines = [
+            f"转账成功：{engine.fmt_money(info['amount'])} 元 → {info['target_name']}",
+            f"你的可用资金: {engine.fmt_money(info['cash'])} 元",
+            f"对方可用资金: {engine.fmt_money(info['target_cash'])} 元",
+        ]
+        if info.get("target_repaid"):
+            lines.append(
+                f"对方有欠款，其中 {engine.fmt_money(info['target_repaid'])} 元已自动还债"
+            )
+        return event.plain_result("\n".join(lines))
 
     async def _cmd_give(self, event, namespace, cfg, rest):
         self._require_market_admin(event, cfg, "发钱")
@@ -677,10 +812,15 @@ class StockMarketPlugin(Star):
                 engine.touch_name(state, target, target_name)
             info = engine.give(state, user, target, amount, cfg)
 
-        return event.plain_result(
-            f"已发放 {engine.fmt_money(info['amount'])} 元给 {info['target_name']}\n"
-            f"对方可用资金: {engine.fmt_money(info['target_cash'])} 元"
-        )
+        lines = [
+            f"已发放 {engine.fmt_money(info['amount'])} 元给 {info['target_name']}",
+            f"对方可用资金: {engine.fmt_money(info['target_cash'])} 元",
+        ]
+        if info.get("target_repaid"):
+            lines.append(
+                f"对方有欠款，其中 {engine.fmt_money(info['target_repaid'])} 元已自动还债"
+            )
+        return event.plain_result("\n".join(lines))
 
     async def _cmd_clear(self, event, namespace, cfg, rest):
         self._require_market_admin(event, cfg, "清零")

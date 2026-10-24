@@ -30,6 +30,8 @@ def position_text(summary: dict[str, Any], round_no: int) -> str:
         f"可用 {fmt_money(summary['cash'])} 元 · 冻结 {fmt_money(summary['frozen'])} 元",
         f"股票市值 {fmt_money(summary['market_value'])} 元",
         f"总资产 {fmt_money(summary['total'])} 元",
+        f"杠杆欠款 {fmt_money(summary['debt'])} 元",
+        f"净资产 {fmt_money(summary['net'])} 元",
         f"累计已实现盈亏 {fmt_money(summary['realized'])} 元",
         f"浮动盈亏 {fmt_money(summary['floating'])} 元",
     ]
@@ -43,6 +45,8 @@ def position_text(summary: dict[str, Any], round_no: int) -> str:
             f"{pos.get('label') or pos['code']}：{pos['shares']}股（冻结 {pos['frozen']}）"
         )
         lines.append(f"  成本 {fmt_money(pos['cost'])} 元 · 浮动盈亏 {fmt_money(pos['floating'])} 元")
+        if pos.get("debt"):
+            lines.append(f"  杠杆欠款 {fmt_money(pos['debt'])} 元（强平线以上）")
     return "\n".join(lines)
 
 
@@ -63,7 +67,7 @@ def rank_text(rows: Sequence[dict[str, Any]], round_no: int) -> str:
             f"{index + 1}. {row['name']}：{fmt_money(row['total'])} 元"
             f"（可用 {fmt_money(row['cash'])}）"
         )
-    lines.append("总资产 = 可用资金 + 冻结资金 + 持仓市值")
+    lines.append("排名按净资产 = 可用资金 + 冻结资金 + 持仓市值 − 杠杆欠款")
     return "\n".join(lines)
 
 
@@ -93,6 +97,7 @@ def help_text(cfg: Config) -> str:
         "/股市 开户\n"
         "/股市 行情 [页码] · 行情 ST001\n"
         "/股市 买入 ST001 100 · 卖出 ST001 100\n"
+        "/股市 融资买入 ST001 100 2 · 杠杆 · 还债\n"
         "/股市 买单 ST001 100 9.50 · 卖单 ST001 100 12.00\n"
         "/股市 挂单 · 撤单 1 · 成交\n"
         "/股市 新闻 · 走势 ST001 · 持仓 [页码]\n"
@@ -101,7 +106,10 @@ def help_text(cfg: Config) -> str:
         "/股市 transfer @对方 1000\n\n"
         f"开户 {fmt_money(cfg.initial_capital)} 元；每 {cfg.round_seconds} 秒更新，"
         f"每轮涨跌 ≤{cfg.max_change_pct:g}%。\n"
-        f"买卖手续费各 {cfg.fee_rate * 100:.3f}%（向上取整到分），全天交易，整数股，不支持做空借贷。\n"
+        f"买卖手续费各 {cfg.fee_rate * 100:.3f}%（向上取整到分），全天交易，整数股，不支持做空。\n"
+        f"杠杆最高 {cfg.max_leverage:g} 倍，欠款日息 {cfg.margin_daily_rate * 100:.3f}%，"
+        f"权益/市值低于 {cfg.margin_call_ratio * 100:.0f}% 自动强平；"
+        "强平后仍欠的钱保留，签到/补助/抢劫等收入优先还债。\n"
         f"限价单冻结资金/股份，{cfg.order_ttl_hours} 小时失效；达到限价即按当时更优报价全额成交。\n"
         f"签到每天一次（基础 {fmt_money(cfg.daily_bonus)} 元，连续签到有加成）；"
         f"总资产低于 {fmt_money(cfg.relief_threshold)} 元可领补助，{cfg.relief_cooldown_hours} 小时一次。\n"

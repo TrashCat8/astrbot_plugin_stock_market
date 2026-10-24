@@ -34,6 +34,11 @@ class Config:
     rob_min_pct: float = 5.0
     rob_max_pct: float = 20.0
     gamble_enabled: bool = True
+    # 玩法：杠杆（倍数开仓，借钱部分计入账户欠款）
+    margin_enabled: bool = True
+    max_leverage: float = 2.0
+    margin_daily_rate: float = 0.0005  # 0.05% / 天
+    margin_call_ratio: float = 0.25  # 权益 / 市值 低于此比例即强平
     # 两套独立白名单：改名 / give+clear，均与 AstrBot 管理员完全独立
     rename_admins: list[str] = field(default_factory=list)
     market_admins: list[str] = field(default_factory=list)
@@ -90,6 +95,10 @@ class Config:
             rob_min_pct=min(100.0, max(0.1, num("rob_min_pct", 5.0, float))),
             rob_max_pct=min(100.0, max(0.1, num("rob_max_pct", 20.0, float))),
             gamble_enabled=bool(cfg.get("gamble_enabled", True)),
+            margin_enabled=bool(cfg.get("margin_enabled", True)),
+            max_leverage=min(10.0, max(1.0, num("max_leverage", 2.0, float))),
+            margin_daily_rate=min(0.01, max(0.0, num("margin_daily_rate", 0.0005, float))),
+            margin_call_ratio=min(0.9, max(0.05, num("margin_call_ratio", 0.25, float))),
             rename_admins=[str(a).strip() for a in rename_admins if str(a).strip()],
             market_admins=[str(a).strip() for a in admins if str(a).strip()],
         )

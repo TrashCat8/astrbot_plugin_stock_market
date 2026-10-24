@@ -198,8 +198,21 @@ def render_position(
     out: Path,
 ) -> Path:
     rows = summary["positions"]
+    items = [
+        ("可用资金", f"{_money(summary['cash'])} 元", TEXT),
+        ("冻结资金", f"{_money(summary['frozen'])} 元", TEXT),
+        ("股票市值", f"{_money(summary['market_value'])} 元", TEXT),
+        ("总资产", f"{_money(summary['total'])} 元", TEXT),
+        ("杠杆欠款", f"{_money(summary['debt'])} 元", _pct_color(-summary["debt"])),
+        ("净资产", f"{_money(summary['net'])} 元", TEXT),
+        (
+            "累计已实现盈亏",
+            f"{_signed_money(summary['realized'])} 元",
+            _pct_color(summary["realized"]),
+        ),
+    ]
     panel_top = 122
-    panel_bottom = panel_top + 5 * 40 + 16
+    panel_bottom = panel_top + len(items) * 40 + 16
     list_top = panel_bottom + 22
     rows_top = list_top + 42
     height = rows_top + max(1, len(rows)) * 62 + 26
@@ -216,13 +229,6 @@ def render_position(
 
     draw.rounded_rectangle((24, panel_top, WIDTH - 24, panel_bottom), radius=18, fill=PANEL)
 
-    items = [
-        ("可用资金", f"{_money(summary['cash'])} 元", TEXT),
-        ("冻结资金", f"{_money(summary['frozen'])} 元", TEXT),
-        ("股票市值", f"{_money(summary['market_value'])} 元", TEXT),
-        ("总资产", f"{_money(summary['total'])} 元", TEXT),
-        ("累计已实现盈亏", f"{_signed_money(summary['realized'])} 元", _pct_color(summary["realized"])),
-    ]
     for index, (label, value, color) in enumerate(items):
         y = panel_top + 30 + index * 40
         draw.text((48, y), label, font=_font(18), fill=MUTED, anchor="lm")
@@ -261,7 +267,8 @@ def render_position(
         )
         draw.text(
             (42, y + 40),
-            f"成本 {_money(pos['cost'])} 元 · 市值 {_money(pos['value'])} 元",
+            f"成本 {_money(pos['cost'])} 元 · 市值 {_money(pos['value'])} 元"
+            + (f" · 负债 {_money(pos['debt'])} 元" if pos.get("debt") else ""),
             font=_font(16),
             fill=DIM,
             anchor="lm",
@@ -520,6 +527,7 @@ _HELP_LINES: list[tuple[str, str]] = [
     ("/股市 行情 [页码]     /股市 行情 ST001", "cmd"),
     ("/股市 买入 ST001 100", "cmd"),
     ("/股市 卖出 ST001 100", "cmd"),
+    ("/股市 融资买入 ST001 100 2  /股市 杠杆  /股市 还债", "cmd"),
     ("/股市 买单 ST001 100 9.50", "cmd"),
     ("/股市 卖单 ST001 100 12.00", "cmd"),
     ("/股市 挂单  /股市 撤单 1  /股市 成交", "cmd"),
@@ -535,6 +543,8 @@ _HELP_LINES: list[tuple[str, str]] = [
     ("限价单冻结资金/股份，{ttl} 小时失效；达到限价即按当时更优报价全额成交，可撤销未成交单。", "text"),
     ("签到每天一次（基础 {daily} 元，连续签到有加成）；总资产低于 {relief} 元可领补助。", "text"),
     ("db：下注 X 元，回报 0～2X 均匀随机；抢劫只抢对方可用资金，失败会被反抢。", "text"),
+    ("杠杆：自有保证金 + 系统垫付，欠款按天计息；权益/市值过低自动强平，", "text"),
+    ("强平后仍欠的钱保留，签到/补助/抢劫等收入优先还债。", "text"),
     ("无主动推送，请用挂单、成交、新闻查询结果。", "muted"),
 ]
 

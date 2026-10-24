@@ -151,5 +151,29 @@
     "type": "bool",
     "default": true,
     "hint": "关闭后 /股市 db 会提示本群未开启。"
+  },
+  "margin_enabled": {
+    "description": "开启杠杆玩法（融资买入）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 /股市 融资买入 会提示本群未开启；已有杠杆持仓仍会正常计息和强平。"
+  },
+  "max_leverage": {
+    "description": "最高杠杆倍数",
+    "type": "float",
+    "default": 2.0,
+    "hint": "允许的最大杠杆，2.0 表示最多 2 倍；必须大于 1，代码会夹在 1～10 之间。"
+  },
+  "margin_daily_rate": {
+    "description": "杠杆欠款日利率",
+    "type": "float",
+    "default": 0.0005,
+    "hint": "0.0005 表示每天 0.05%，按 UTC+8 自然日计息，利息并入欠款。"
+  },
+  "margin_call_ratio": {
+    "description": "强平线（权益/市值，0～1）",
+    "type": "float",
+    "default": 0.25,
+    "hint": "持仓权益（市值−欠款）占市值的比例低于该值时自动强平；0.25 表示跌到 25% 强平，越大越容易触发。"
   }
 }

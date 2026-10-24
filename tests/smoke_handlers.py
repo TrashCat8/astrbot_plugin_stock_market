@@ -96,6 +96,9 @@ async def main() -> int:
     check("排行", await call("rank"), "image")
     check("盈亏", await call("profit"), "image")
     check("db", await call("gamble", "100"))
+    check("融资买入", await call("margin_buy", "ST003", "10", "2"))
+    check("杠杆查询", await call("leverage"))
+    check("还债", await call("repay"))
 
     # 补助：资产充足时应当被拒绝
     try:

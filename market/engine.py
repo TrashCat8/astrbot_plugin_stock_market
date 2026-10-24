@@ -88,21 +88,28 @@ def new_state(group: str, now: float, cfg: Config) -> dict[str, Any]:
 
 
 def advance(state: dict[str, Any], now: float, cfg: Config) -> int:
-    """把行情补算到当前轮次，返回本次推进的轮数。"""
+    """把行情补算到当前轮次，返回本次推进的轮数。
+
+    杠杆欠款按 UTC+8 自然日计息、按最新行情检查强平，两者都挂在这里，
+    因此不需要后台任务，容器重启后也能补算。
+    """
     target = current_round(state, now, cfg)
-    if target <= state["round"]:
-        return 0
+    advanced = 0
+    if target > state["round"]:
+        start = state["round"] + 1
+        if target - start + 1 > cfg.max_catchup:
+            # 长期无人使用后不逐个补算，直接跳到最近的窗口，避免卡死
+            start = max(1, target - cfg.max_catchup + 1)
+            state["round"] = start - 1
 
-    start = state["round"] + 1
-    if target - start + 1 > cfg.max_catchup:
-        # 长期无人使用后不逐个补算，直接跳到最近的窗口，避免卡死
-        start = max(1, target - cfg.max_catchup + 1)
-        state["round"] = start - 1
+        for round_no in range(start, target + 1):
+            _apply_round(state, round_no, cfg)
+            state["round"] = round_no
+        advanced = target - start + 1
 
-    for round_no in range(start, target + 1):
-        _apply_round(state, round_no, cfg)
-        state["round"] = round_no
-    return target - start + 1
+    _accrue_interest(state, now, cfg)
+    _check_liquidations(state, now, cfg)
+    return advanced
 
 
 def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
@@ -165,12 +172,14 @@ def ensure_account(state: dict[str, Any], user: str, cfg: Config) -> dict[str, A
             "frozen": 0,
             "positions": {},
             "realized": 0,
+            "debt": 0,
             "created_at": int(time.time()),
         }
         accounts[user] = acc
     acc.setdefault("positions", {})
     acc.setdefault("frozen", 0)
     acc.setdefault("realized", 0)
+    acc.setdefault("debt", 0)
     return acc
 
 
@@ -187,11 +196,12 @@ def position_of(acc: dict[str, Any], code: str, create: bool = False) -> dict[st
     if pos is None:
         if not create:
             return None
-        pos = {"shares": 0, "frozen": 0, "cost": 0}
+        pos = {"shares": 0, "frozen": 0, "cost": 0, "debt": 0}
         positions[code] = pos
     pos.setdefault("shares", 0)
     pos.setdefault("frozen", 0)
     pos.setdefault("cost", 0)
+    pos.setdefault("debt", 0)
     return pos
 
 
@@ -267,6 +277,53 @@ def _consume_cost(pos: dict[str, int], shares: int) -> int:
     return cost_sold
 
 
+def _settle_sale(
+    acc: dict[str, Any], pos: dict[str, Any], count: int, price: int, cfg: Config
+) -> dict[str, int]:
+    """按市价卖出 count 股并结算杠杆欠款，返回本次成交的各项金额。
+
+    杠杆持仓卖出时按股数比例偿还欠款；极端情况下成交额不足以还清，
+    差额留在账户欠款里，后续资金自动优先偿还。
+    """
+    held = int(pos["shares"])
+    amount = price * count
+    fee = calc_fee(amount, cfg)
+    proceeds = amount - fee
+
+    debt_total = int(pos.get("debt", 0))
+    if debt_total > 0:
+        debt_due = debt_total if count >= held else debt_total * count // held
+        debt_due = min(debt_due, debt_total)
+    else:
+        debt_due = 0
+
+    cost_sold = _consume_cost(pos, count)
+    pos["debt"] = debt_total - debt_due
+    pos["shares"] = held - count
+    if pos["shares"] <= 0:
+        pos["shares"] = 0
+        pos["frozen"] = 0
+        pos["cost"] = 0
+        pos["debt"] = 0
+
+    # 签到/补助等收入可能已经提前还掉一部分欠款，因此偿还额不能超过账户实际欠款
+    repay = min(debt_due, proceeds, int(acc.get("debt", 0)))
+    acc["debt"] = max(0, int(acc.get("debt", 0)) - repay)
+    acc["cash"] = int(acc.get("cash", 0)) + proceeds - repay
+    pnl = proceeds - debt_due - cost_sold
+    acc["realized"] = int(acc.get("realized", 0)) + pnl
+
+    return {
+        "amount": amount,
+        "fee": fee,
+        "proceeds": proceeds,
+        "cost_sold": cost_sold,
+        "debt_due": debt_due,
+        "repay": repay,
+        "pnl": pnl,
+    }
+
+
 def _record_trade(
     state: dict[str, Any],
     user: str,
@@ -338,19 +395,8 @@ def sell(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -
         raise MarketError(f"可卖股份不足：持有 {held} 股，可卖 {available} 股（不支持做空）。")
 
     price = int(stock["price"])
-    amount = price * count
-    fee = calc_fee(amount, cfg)
-    proceeds = amount - fee
-    cost_sold = _consume_cost(pos, count)
-    pos["shares"] -= count
-    if pos["shares"] <= 0:
-        pos["shares"] = 0
-        pos["frozen"] = 0
-        pos["cost"] = 0
-
-    acc["cash"] += proceeds
-    acc["realized"] += proceeds - cost_sold
-    _record_trade(state, user, "market", "sell", stock["code"], count, price, fee)
+    result = _settle_sale(acc, pos, count, price, cfg)
+    _record_trade(state, user, "market", "sell", stock["code"], count, price, result["fee"])
 
     return {
         "code": stock["code"],
@@ -358,10 +404,90 @@ def sell(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -
         "label": display_label(stock),
         "shares": count,
         "price": price,
-        "fee": fee,
-        "proceeds": proceeds,
+        "fee": result["fee"],
+        "proceeds": result["proceeds"],
         "cash": acc["cash"],
-        "realized": proceeds - cost_sold,
+        "realized": result["pnl"],
+        "repaid": result["repay"],
+        "debt": int(acc.get("debt", 0)),
+    }
+
+
+def _parse_leverage(text: Any, cfg: Config) -> float:
+    """解析「2」「2x」「2倍」这类杠杆倍数输入。"""
+    raw = str(text or "").strip().lower().rstrip("x倍")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        raise MarketError("杠杆倍数格式不正确，例如「2」表示 2 倍。")
+    if value <= 1.0:
+        raise MarketError("杠杆倍数必须大于 1，不加杠杆请直接用「/股市 买入」。")
+    if value > cfg.max_leverage + 1e-9:
+        raise MarketError(f"杠杆倍数不能超过 {cfg.max_leverage:g} 倍。")
+    return value
+
+
+def leverage_buy(
+    state: dict[str, Any],
+    user: str,
+    key: str,
+    shares: Any,
+    leverage_text: Any,
+    cfg: Config,
+) -> dict[str, Any]:
+    """倍数开仓：只冻结自有保证金，其余由系统垫付并记入账户欠款。
+
+    盈亏按整笔市值计算，所以相当于按倍数放大；欠款按自然日计息，
+    权益/市值跌破维持保证金比例时自动强平。
+    """
+    if not cfg.margin_enabled:
+        raise MarketError("本群没有开启杠杆玩法。")
+    stock = find_stock(state, key)
+    count = _check_shares(shares)
+    leverage = _parse_leverage(leverage_text, cfg)
+    acc = require_account(state, user)
+
+    debt = int(acc.get("debt", 0))
+    if debt > 0:
+        raise MarketError(
+            f"你还有 {fmt_money(debt)} 元欠款，还清前不能继续融资买入（/股市 还债）。"
+        )
+
+    price = int(stock["price"])
+    amount = price * count
+    fee = calc_fee(amount, cfg)
+    margin = int(
+        (Decimal(amount) / Decimal(str(leverage))).to_integral_value(rounding=ROUND_CEILING)
+    )
+    borrowed = amount - margin
+    if acc["cash"] < margin + fee:
+        raise MarketError(
+            f"保证金不足：{leverage:g} 倍需要自有资金 {fmt_money(margin)} 元"
+            f"（另加手续费 {fmt_money(fee)} 元），当前可用 {fmt_money(acc['cash'])} 元。"
+        )
+
+    acc["cash"] -= margin + fee
+    acc["debt"] = debt + borrowed
+    acc["debt_day"] = day_number(time.time())
+
+    pos = position_of(acc, stock["code"], create=True)
+    pos["shares"] += count
+    pos["cost"] += margin + fee
+    pos["debt"] = int(pos.get("debt", 0)) + borrowed
+    _record_trade(state, user, "margin", "buy", stock["code"], count, price, fee)
+
+    return {
+        "code": stock["code"],
+        "name": display_name(stock),
+        "label": display_label(stock),
+        "shares": count,
+        "price": price,
+        "leverage": leverage,
+        "fee": fee,
+        "margin": margin,
+        "borrowed": borrowed,
+        "cash": acc["cash"],
+        "debt": int(acc["debt"]),
     }
 
 
@@ -451,15 +577,7 @@ def _execute_order(
         pos["frozen"] -= count
         if pos["frozen"] < 0:
             pos["frozen"] = 0
-        cost_sold = _consume_cost(pos, count)
-        pos["shares"] -= count
-        proceeds = amount - fee
-        acc["cash"] += proceeds
-        acc["realized"] += proceeds - cost_sold
-        if pos["shares"] <= 0:
-            pos["shares"] = 0
-            pos["frozen"] = 0
-            pos["cost"] = 0
+        _settle_sale(acc, pos, count, price, cfg)
 
     state["orders"].pop(str(order["id"]), None)
     _record_trade(state, order["user"], "limit", order["side"], code, count, price, fee)
@@ -524,6 +642,184 @@ def account_total(state: dict[str, Any], acc: dict[str, Any]) -> int:
     return total
 
 
+def account_net(state: dict[str, Any], acc: dict[str, Any]) -> int:
+    """净资产 = 可用 + 冻结 + 持仓市值 − 欠款。"""
+    return account_total(state, acc) - int(acc.get("debt", 0))
+
+
+def _credit(acc: dict[str, Any], amount: int) -> int:
+    """入账：有杠杆欠款时优先还债，剩下的才进可用资金。返回本次还掉的金额。"""
+    amount = max(0, int(amount))
+    debt = int(acc.get("debt", 0))
+    if debt <= 0 or amount <= 0:
+        acc["cash"] = int(acc.get("cash", 0)) + amount
+        return 0
+    repay = min(debt, amount)
+    acc["debt"] = debt - repay
+    acc["cash"] = int(acc.get("cash", 0)) + amount - repay
+    return repay
+
+
+def pop_notices(acc: dict[str, Any]) -> list[str]:
+    """取出待展示的强平/计息通知（取完即清，避免每次指令都重复提示）。"""
+    notices = acc.pop("notices", None) or []
+    return [str(item) for item in notices][:5]
+
+
+def _accrue_interest(state: dict[str, Any], now: float, cfg: Config) -> None:
+    """欠款按 UTC+8 自然日计息，利息并入欠款（不产生负现金）。"""
+    if cfg.margin_daily_rate <= 0:
+        return
+    today = day_number(now)
+    rate = Decimal(str(cfg.margin_daily_rate))
+    for acc in (state.get("accounts") or {}).values():
+        debt = int(acc.get("debt", 0))
+        if debt <= 0:
+            acc["debt_day"] = today
+            continue
+        last = int(acc.get("debt_day") or today)
+        days = today - last
+        if days <= 0:
+            continue
+        interest = int(
+            (Decimal(debt) * rate * days).to_integral_value(rounding=ROUND_CEILING)
+        )
+        if interest > 0:
+            debt += interest
+            acc["debt"] = debt
+            notices = acc.setdefault("notices", [])
+            notices.append(
+                f"📈 杠杆欠款计息 +{fmt_money(interest)} 元（{days} 天），当前欠款 {fmt_money(debt)} 元。"
+            )
+            if len(notices) > 5:
+                del notices[: len(notices) - 5]
+        acc["debt_day"] = today
+
+
+def _cancel_sell_orders(state: dict[str, Any], user: str, code: str) -> None:
+    """强平前撤掉该持仓上的卖单，把冻结股份放回来。"""
+    acc = state["accounts"].get(user)
+    pos = (acc or {}).get("positions", {}).get(code)
+    for oid, order in list(state.get("orders", {}).items()):
+        if order.get("user") != user or order.get("code") != code:
+            continue
+        if order.get("side") == "sell" and pos is not None:
+            pos["frozen"] = max(0, int(pos.get("frozen", 0)) - int(order["shares"]))
+        state["orders"].pop(oid, None)
+
+
+def _check_liquidations(state: dict[str, Any], now: float, cfg: Config) -> None:
+    """杠杆持仓的权益/市值跌破维持保证金比例时，按市价全部强平。
+
+    成交额不够还清欠款的，差额留在账户欠款里，后续收入自动优先抵扣。
+    """
+    for user, acc in (state.get("accounts") or {}).items():
+        for code, pos in list((acc.get("positions") or {}).items()):
+            debt = int(pos.get("debt", 0))
+            shares = int(pos.get("shares", 0))
+            if debt <= 0 or shares <= 0:
+                continue
+            stock = state["stocks"].get(code)
+            if stock is None:
+                continue
+            price = int(stock["price"])
+            value = price * shares
+            equity = value - debt
+            if equity > 0 and equity >= value * cfg.margin_call_ratio:
+                continue
+
+            _cancel_sell_orders(state, user, code)
+            result = _settle_sale(acc, pos, shares, price, cfg)
+            label = display_label(stock)
+            text = (
+                f"⚠️ 强平：{label} {shares} 股已按 "
+                f"{fmt_money(price, comma=False)} 元强制卖出，"
+                f"偿还欠款 {fmt_money(result['repay'])} 元。"
+            )
+            left = int(acc.get("debt", 0))
+            if left > 0:
+                text += f"剩余欠款 {fmt_money(left)} 元，后续收入会自动优先还债。"
+            notices = acc.setdefault("notices", [])
+            notices.append(text)
+            if len(notices) > 5:
+                del notices[: len(notices) - 5]
+            _record_trade(state, user, "liquidate", "sell", code, shares, price, result["fee"])
+
+
+def repay_debt(
+    state: dict[str, Any], user: str, amount_text: Any, cfg: Config
+) -> dict[str, Any]:
+    """用可用资金还杠杆欠款；不填金额表示能还多少还多少。"""
+    acc = require_account(state, user)
+    debt = int(acc.get("debt", 0))
+    if debt <= 0:
+        raise MarketError("你没有欠款。")
+    cash = int(acc.get("cash", 0))
+    text = str(amount_text or "").strip()
+    if text:
+        amount = _parse_amount(text)
+        if amount > cash:
+            raise MarketError(f"可用资金不足：当前可用 {fmt_money(cash)} 元。")
+    else:
+        amount = min(cash, debt)
+    if amount <= 0:
+        raise MarketError("可用资金为 0，暂时没法还债。")
+    pay = min(amount, debt)
+    acc["cash"] = cash - pay
+    acc["debt"] = debt - pay
+    return {
+        "amount": pay,
+        "cash": acc["cash"],
+        "debt": acc["debt"],
+    }
+
+
+def leverage_info(state: dict[str, Any], user: str, cfg: Config) -> dict[str, Any]:
+    acc = require_account(state, user)
+    debt = int(acc.get("debt", 0))
+    rows = []
+    for code, pos in sorted((acc.get("positions") or {}).items()):
+        shares = int(pos.get("shares", 0))
+        pos_debt = int(pos.get("debt", 0))
+        if shares <= 0 or pos_debt <= 0:
+            continue
+        stock = state["stocks"].get(code)
+        price = int(stock["price"]) if stock else 0
+        value = price * shares
+        equity = value - pos_debt
+        ratio = (equity / value * 100.0) if value > 0 else 0.0
+        keep = max(0.0001, 1.0 - float(cfg.margin_call_ratio))
+        liq_price = int(
+            (Decimal(pos_debt) / Decimal(str(shares * keep))).to_integral_value(
+                rounding=ROUND_CEILING
+            )
+        )
+        rows.append(
+            {
+                "code": code,
+                "label": display_label(stock) if stock else code,
+                "shares": shares,
+                "price": price,
+                "debt": pos_debt,
+                "value": value,
+                "equity": equity,
+                "ratio": ratio,
+                "liq_price": liq_price,
+            }
+        )
+    total_assets = account_total(state, acc)
+    return {
+        "debt": debt,
+        "cash": int(acc.get("cash", 0)),
+        "total": total_assets,
+        "net": total_assets - debt,
+        "max_leverage": float(cfg.max_leverage),
+        "daily_rate": float(cfg.margin_daily_rate),
+        "call_ratio": float(cfg.margin_call_ratio),
+        "positions": rows,
+    }
+
+
 def touch_name(state: dict[str, Any], user: str, name: str | None) -> None:
     """把群昵称记进账户，排行榜就不用显示一串 QQ 号。"""
     acc = state.get("accounts", {}).get(user)
@@ -549,7 +845,7 @@ def checkin(
     base = int(cfg.daily_bonus)
     amount = base + int(round(base * bonus_pct / 100.0))
 
-    acc["cash"] = int(acc.get("cash", 0)) + amount
+    repaid = _credit(acc, amount)
     acc["last_checkin"] = day
     acc["last_checkin_day"] = today
     acc["streak"] = streak
@@ -559,6 +855,8 @@ def checkin(
         "bonus_pct": bonus_pct,
         "streak": streak,
         "cash": acc["cash"],
+        "repaid": repaid,
+        "debt": int(acc.get("debt", 0)),
     }
 
 
@@ -567,10 +865,10 @@ def relief(
 ) -> dict[str, Any]:
     now = time.time() if now is None else now
     acc = require_account(state, user)
-    total = account_total(state, acc)
+    total = account_net(state, acc)
     if total >= int(cfg.relief_threshold):
         raise MarketError(
-            f"总资产 {fmt_money(total)} 元，还没到补助线"
+            f"净资产 {fmt_money(total)} 元，还没到补助线"
             f"（低于 {fmt_money(cfg.relief_threshold)} 元才能领）。"
         )
     wait = int(cfg.relief_cooldown_hours) * 3600
@@ -579,12 +877,14 @@ def relief(
         remain = max(1, int((wait - (now - last)) // 60) + 1)
         raise MarketError(f"补助冷却中，还需约 {remain} 分钟。")
 
-    acc["cash"] = int(acc.get("cash", 0)) + int(cfg.relief_amount)
+    repaid = _credit(acc, int(cfg.relief_amount))
     acc["last_relief"] = int(now)
     return {
         "amount": int(cfg.relief_amount),
         "total_before": total,
         "cash": acc["cash"],
+        "repaid": repaid,
+        "debt": int(acc.get("debt", 0)),
     }
 
 
@@ -593,16 +893,18 @@ def rank(
 ) -> list[dict[str, Any]]:
     rows = []
     for user, acc in (state.get("accounts") or {}).items():
-        total = account_total(state, acc)
+        assets = account_total(state, acc)
         cash = int(acc.get("cash", 0))
         frozen = int(acc.get("frozen", 0))
+        debt = int(acc.get("debt", 0))
         rows.append(
             {
                 "user": user,
                 "name": acc.get("name") or user,
                 "cash": cash,
-                "market_value": total - cash - frozen,
-                "total": total,
+                "market_value": assets - cash - frozen,
+                "debt": debt,
+                "total": assets - debt,
             }
         )
     rows.sort(key=lambda row: (-row["total"], row["user"]))
@@ -624,7 +926,9 @@ def pnl_of(state: dict[str, Any], acc: dict[str, Any]) -> tuple[int, int]:
         stock = state["stocks"].get(code)
         if stock is None:
             continue
-        floating += int(stock["price"]) * shares - int(pos.get("cost", 0))
+        floating += (
+            int(stock["price"]) * shares - int(pos.get("debt", 0)) - int(pos.get("cost", 0))
+        )
     return realized, floating
 
 
@@ -729,13 +1033,15 @@ def rob(
     if success:
         amount = min(target_cash, max(1, int(target_cash * pct / 100.0)))
         target_acc["cash"] = target_cash - amount
-        acc["cash"] = int(acc.get("cash", 0)) + amount
+        repaid = _credit(acc, amount)
         return {
             "success": True,
             "chance": chance,
             "pct": pct,
             "amount": amount,
             "cash": acc["cash"],
+            "repaid": repaid,
+            "debt": int(acc.get("debt", 0)),
             "target_cash": target_acc["cash"],
         }
 
@@ -792,13 +1098,14 @@ def transfer(
         raise MarketError(f"可用资金不足：当前可用 {fmt_money(cash)} 元。")
 
     acc["cash"] = cash - amount
-    target_acc["cash"] = int(target_acc.get("cash", 0)) + amount
+    target_repaid = _credit(target_acc, amount)
     return {
         "amount": amount,
         "cash": acc["cash"],
         "target": target,
         "target_name": target_acc.get("name") or target,
         "target_cash": target_acc["cash"],
+        "target_repaid": target_repaid,
     }
 
 
@@ -811,12 +1118,13 @@ def give(
     """
     target, target_acc = _require_target(state, user, target, allow_self=True)
     amount = _parse_amount(amount_text)
-    target_acc["cash"] = int(target_acc.get("cash", 0)) + amount
+    target_repaid = _credit(target_acc, amount)
     return {
         "amount": amount,
         "target": target,
         "target_name": target_acc.get("name") or target,
         "target_cash": target_acc["cash"],
+        "target_repaid": target_repaid,
     }
 
 
@@ -884,6 +1192,7 @@ def account_summary(state: dict[str, Any], user: str) -> dict[str, Any]:
         value = price * shares
         market_value += value
         cost_total += int(pos.get("cost", 0))
+        debt = int(pos.get("debt", 0))
         rows.append(
             {
                 "code": code,
@@ -892,21 +1201,26 @@ def account_summary(state: dict[str, Any], user: str) -> dict[str, Any]:
                 "shares": shares,
                 "frozen": int(pos.get("frozen", 0)),
                 "cost": int(pos.get("cost", 0)),
+                "debt": debt,
                 "price": price,
                 "value": value,
-                "floating": value - int(pos.get("cost", 0)),
+                "floating": value - debt - int(pos.get("cost", 0)),
             }
         )
 
     frozen = int(acc.get("frozen", 0))
+    debt_total = int(acc.get("debt", 0))
+    total = int(acc["cash"]) + frozen + market_value
     return {
         "cash": int(acc["cash"]),
         "frozen": frozen,
         "market_value": market_value,
         "cost": cost_total,
-        "floating": market_value - cost_total,
+        "debt": debt_total,
+        "floating": market_value - cost_total - sum(row["debt"] for row in rows),
         "realized": int(acc.get("realized", 0)),
-        "total": int(acc["cash"]) + frozen + market_value,
+        "total": total,
+        "net": total - debt_total,
         "positions": rows,
     }
 

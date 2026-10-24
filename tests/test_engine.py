@@ -209,6 +209,139 @@ def test_sell_realized_pnl() -> None:
     assert acc["positions"]["ST001"]["shares"] == 0
 
 
+def test_leverage_buy_uses_margin() -> None:
+    """2 倍开仓只冻结一半自有资金，其余记入账户和持仓欠款。"""
+    state = fresh()
+    engine.ensure_account(state, "u1", CFG)
+    trade = engine.leverage_buy(state, "u1", "ST001", "100", "2", CFG)
+    assert trade["price"] == 1000
+    assert trade["margin"] == 50_000, trade
+    assert trade["borrowed"] == 50_000, trade
+    assert trade["fee"] == 100, trade
+    assert trade["cash"] == 10_000_000 - 50_100, trade
+    assert trade["debt"] == 50_000, trade
+
+    acc = state["accounts"]["u1"]
+    pos = acc["positions"]["ST001"]
+    assert pos["shares"] == 100
+    assert pos["cost"] == 50_100
+    assert pos["debt"] == 50_000
+
+    summary = engine.account_summary(state, "u1")
+    assert summary["market_value"] == 100_000
+    assert summary["total"] == 10_049_900
+    assert summary["debt"] == 50_000
+    assert summary["net"] == 9_999_900
+    assert summary["floating"] == -100
+
+
+def test_leverage_guards() -> None:
+    state = fresh()
+    engine.ensure_account(state, "u1", CFG)
+    for bad in ("1", "2.5", "abc"):
+        try:
+            engine.leverage_buy(state, "u1", "ST001", "10", bad, CFG)
+        except engine.MarketError:
+            pass
+        else:
+            raise AssertionError(f"杠杆 {bad} 应当报错")
+    engine.leverage_buy(state, "u1", "ST001", "10", "2", CFG)
+    try:
+        engine.leverage_buy(state, "u1", "ST001", "10", "2", CFG)
+    except engine.MarketError:
+        pass
+    else:
+        raise AssertionError("有欠款时不应允许继续融资")
+
+
+def test_leverage_interest_daily() -> None:
+    """欠款按自然日计息，利息并入欠款。"""
+    cfg = Config(round_seconds=10**9, margin_daily_rate=0.0005)
+    now = time.time()
+    state = engine.new_state("group_1", now, cfg)
+    engine.ensure_account(state, "u1", cfg)
+    engine.leverage_buy(state, "u1", "ST001", "100", "2", cfg)
+    engine.advance(state, now + 2 * 86400, cfg)
+    assert state["accounts"]["u1"]["debt"] == 50_050, state["accounts"]["u1"]["debt"]
+
+
+def test_liquidation_repays_debt() -> None:
+    now = time.time()
+    state = fresh(now)
+    engine.ensure_account(state, "u1", CFG)
+    engine.leverage_buy(state, "u1", "ST001", "100", "2", CFG)
+    state["stocks"]["ST001"]["price"] = 600  # 市值 60,000，权益 10,000，权益比 16.7%
+    engine.advance(state, now, CFG)
+
+    acc = state["accounts"]["u1"]
+    assert acc["positions"]["ST001"]["shares"] == 0
+    assert acc["debt"] == 0
+    # 60,000 − 60 手续费 = 59,940，先还 50,000 欠款
+    assert acc["cash"] == 9_949_900 + 9_940, acc["cash"]
+    assert acc["realized"] == 59_940 - 50_000 - 50_100
+    assert any("强平" in note for note in acc["notices"])
+
+
+def test_liquidation_keeps_shortfall_then_income_repays() -> None:
+    now = time.time()
+    state = fresh(now)
+    engine.ensure_account(state, "u1", CFG)
+    engine.leverage_buy(state, "u1", "ST001", "100", "2", CFG)
+    state["stocks"]["ST001"]["price"] = 400  # 市值 40,000，权益为负
+    engine.advance(state, now, CFG)
+
+    acc = state["accounts"]["u1"]
+    # 40,000 − 40 手续费 = 39,960，不够还 50,000，差额保留为欠款
+    assert acc["debt"] == 10_040, acc["debt"]
+    assert acc["cash"] == 9_949_900, acc["cash"]
+
+    info = engine.checkin(state, "u1", CFG, now)
+    assert info["repaid"] == 10_040, info
+    assert acc["debt"] == 0
+    assert acc["cash"] == 9_949_900 + 200_000 - 10_040
+
+
+def test_leverage_sell_repays_proportional_debt() -> None:
+    state = fresh()
+    engine.ensure_account(state, "u1", CFG)
+    engine.leverage_buy(state, "u1", "ST001", "100", "2", CFG)
+    state["stocks"]["ST001"]["price"] = 1200
+    trade = engine.sell(state, "u1", "ST001", "50", CFG)
+    # 卖出 60,000 − 60 = 59,940，按股数偿还一半欠款 25,000
+    assert trade["repaid"] == 25_000, trade
+    assert trade["debt"] == 25_000, trade
+    assert trade["realized"] == 59_940 - 25_000 - 25_050
+    acc = state["accounts"]["u1"]
+    assert acc["cash"] == 9_949_900 + 59_940 - 25_000
+    assert acc["positions"]["ST001"]["debt"] == 25_000
+    assert acc["positions"]["ST001"]["cost"] == 25_050
+
+
+def test_repay_debt_command() -> None:
+    state = fresh()
+    engine.ensure_account(state, "u1", CFG)
+    engine.leverage_buy(state, "u1", "ST001", "10", "2", CFG)
+    info = engine.repay_debt(state, "u1", "1000", CFG)
+    assert info["amount"] == 5_000, info  # 欠款只有 5,000 分，多还的部分不扣
+    assert info["debt"] == 0
+    assert state["accounts"]["u1"]["cash"] == 10_000_000 - 5_010 - 5_000
+    try:
+        engine.repay_debt(state, "u1", "", CFG)
+    except engine.MarketError:
+        pass
+    else:
+        raise AssertionError("没有欠款时还债应当报错")
+
+
+def test_rank_uses_net_assets() -> None:
+    state = fresh()
+    engine.ensure_account(state, "u1", CFG)
+    engine.leverage_buy(state, "u1", "ST001", "100", "2", CFG)
+    rows = engine.rank(state, CFG, 10)
+    assert rows[0]["debt"] == 50_000
+    assert rows[0]["total"] == 9_999_900, rows[0]
+
+
 def test_news_deterministic() -> None:
     cfg = Config(news_probability=1.0)
     now = 1_700_000_000.0
