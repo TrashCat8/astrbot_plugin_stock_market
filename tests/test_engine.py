@@ -427,19 +427,20 @@ def test_rob_guards() -> None:
 
 
 def test_rob_chance_uses_available_cash() -> None:
-    """成功率按双方「可用资金」差计算，持仓市值不参与。"""
+    """成功率按双方「可用资金」差计算（每 500 元 1 个百分点），持仓市值不参与。"""
     state = fresh()
     a = engine.ensure_account(state, "u1", CFG)
     b = engine.ensure_account(state, "u2", CFG)
-    a["cash"], b["cash"] = 1_000_000, 2_000_000  # 1 万 / 2 万元
-    # u1 持仓市值 1 万元，但现金只有 1 万；若按总资产算概率会明显不同
+    a["cash"], b["cash"] = 1_000_000, 1_500_000  # 1 万 / 1.5 万元
+    # u1 持仓市值 1 万元：按总资产算是 2 万 > 1.5 万（旧口径会顶到 75%），
+    # 按可用资金算则是 1 万 < 1.5 万，应为 40 - 10 = 30%
     a["positions"]["ST001"] = {"shares": 1000, "cost": 1_000_000}
     now = 1_700_000_000.0
     a["last_rob"] = 0
     info = engine.rob(state, "u1", "u2", CFG, now)
-    expected = max(25.0, min(75.0, CFG.rob_base_chance + ((1_000_000 - 2_000_000) / 100.0) / 50.0))
+    expected = max(25.0, min(75.0, CFG.rob_base_chance + ((1_000_000 - 1_500_000) / 100.0) / 500.0))
     assert info["chance"] == expected, info
-    assert info["chance"] == 25.0, info
+    assert info["chance"] == 30.0, info
 
 
 def test_rob_amount_range_and_cooldown() -> None:

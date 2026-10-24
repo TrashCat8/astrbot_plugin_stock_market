@@ -715,9 +715,10 @@ def rob(
         remain = max(1, int((cooldown - (now - last)) // 60) + 1)
         raise MarketError(f"抢劫冷却中，还需约 {remain} 分钟。")
 
-    # 以双方「可用资金」为基准（元）比较：抢劫只抢现金，持仓市值不参与概率计算
+    # 以双方「可用资金」为基准（元）比较：抢劫只抢现金，持仓市值不参与概率计算。
+    # 除数 500：每差 500 元加减 1 个百分点，约 ±1.75 万元才触顶/触底，避免经常贴边。
     my_cash = int(acc.get("cash", 0))
-    chance = float(cfg.rob_base_chance) + ((my_cash - target_cash) / 100.0) / 50.0
+    chance = float(cfg.rob_base_chance) + ((my_cash - target_cash) / 100.0) / 500.0
     chance = max(25.0, min(75.0, chance))
     success = _sysrand.randint(1, 100) <= chance
 
