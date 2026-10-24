@@ -54,7 +54,10 @@ class FakeEvent:
 
 
 async def main() -> int:
-    plugin = StockMarketPlugin(None, {"market_admins": ["10001"]})  # type: ignore[arg-type]
+    # 两套白名单故意给不同的人：10001 管 give/clear，10002 管改名
+    plugin = StockMarketPlugin(  # type: ignore[arg-type]
+        None, {"market_admins": ["10001"], "rename_admins": ["10002"]}
+    )
     cfg = plugin._cfg()
     namespace = "group_123456"
     event = FakeEvent(admin=True)
@@ -85,7 +88,7 @@ async def main() -> int:
     check("新闻", await call("news"))
     check("走势", await call("chart", "ST001"), "image")
     check("帮助", await call("help"), "image")
-    check("改名", await call("rename", "ST001", "星辰科技"))
+    check("改名", await plugin._cmd_rename(FakeEvent(uid="10002"), namespace, cfg, ["ST001", "星辰科技"]))
     check("卖出", await call("sell", "ST001", "20"))
     check("成交", await call("trades"))
     check("撤单", await call("cancel", "1"))
@@ -120,14 +123,24 @@ async def main() -> int:
         failures.append("give权限")
         print("FAIL AstrBot 管理员不应自动获得股市管理员权限")
 
-    # 改名同样只看股市管理员名单
+    # 改名只看改名白名单：AstrBot 管理员不行，give/clear 白名单成员也不行
+    for uid, admin, label in (("10003", True, "AstrBot 管理员"), ("10001", False, "give 管理员")):
+        try:
+            await plugin._cmd_rename(FakeEvent(uid=uid, admin=admin), namespace, cfg, ["ST002", "测试名"])
+        except Exception as exc:  # noqa: BLE001
+            print(f"OK   改名权限拒绝({label}): {exc}")
+        else:
+            failures.append(f"改名权限{uid}")
+            print(f"FAIL {label}不应自动获得改名权限")
+
+    # 反向：改名白名单成员不能 give / clear
     try:
-        await plugin._cmd_rename(FakeEvent(uid="10003", admin=True), namespace, cfg, ["ST002", "测试名"])
+        await plugin._cmd_give(FakeEvent(uid="10002"), namespace, cfg, ["10001", "10"])
     except Exception as exc:  # noqa: BLE001
-        print(f"OK   改名权限拒绝: {exc}")
+        print(f"OK   give权限拒绝(改名管理员): {exc}")
     else:
-        failures.append("改名权限")
-        print("FAIL AstrBot 管理员不应自动获得改名权限")
+        failures.append("give权限2")
+        print("FAIL 改名管理员不应自动获得 give 权限")
 
     # 别名解析：走真实入口，确认「/股市 transfer ...」能分发到 transfer
     async for res in plugin.market(event, "transfer 10003 1"):

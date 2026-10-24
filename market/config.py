@@ -34,7 +34,8 @@ class Config:
     rob_min_pct: float = 5.0
     rob_max_pct: float = 20.0
     gamble_enabled: bool = True
-    # 股市自己的管理员名单（只作用于 give / clear），与 AstrBot 管理员完全独立
+    # 两套独立白名单：改名 / give+clear，均与 AstrBot 管理员完全独立
+    rename_admins: list[str] = field(default_factory=list)
     market_admins: list[str] = field(default_factory=list)
 
     @property
@@ -58,10 +59,13 @@ class Config:
         if not isinstance(groups, (list, tuple)):
             groups = []
 
-        # 默认空名单：give / clear 需要管理员在插件配置里手动填写，代码里不留任何 QQ 号
+        # 默认空名单：改名 / give / clear 都需在插件配置里手动填写，代码里不留任何 QQ 号
         admins = cfg.get("market_admins") or []
         if not isinstance(admins, (list, tuple)):
             admins = []
+        rename_admins = cfg.get("rename_admins") or []
+        if not isinstance(rename_admins, (list, tuple)):
+            rename_admins = []
 
         return cls(
             initial_capital=max(0, int(round(num("initial_capital", 100000.0, float) * 100))),
@@ -86,5 +90,6 @@ class Config:
             rob_min_pct=min(100.0, max(0.1, num("rob_min_pct", 5.0, float))),
             rob_max_pct=min(100.0, max(0.1, num("rob_max_pct", 20.0, float))),
             gamble_enabled=bool(cfg.get("gamble_enabled", True)),
+            rename_admins=[str(a).strip() for a in rename_admins if str(a).strip()],
             market_admins=[str(a).strip() for a in admins if str(a).strip()],
         )

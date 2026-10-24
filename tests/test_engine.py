@@ -27,12 +27,16 @@ def fresh(now: float | None = None) -> dict:
     return engine.new_state("group_1", now or time.time(), CFG)
 
 
-def test_market_admins_default_empty() -> None:
-    """代码里不得留任何 QQ 号：未配置时名单为空，give / clear 谁都用不了。"""
+def test_admin_lists_default_empty() -> None:
+    """代码里不得留任何 QQ 号：未配置时两张名单都为空，改名 / give / clear 谁都用不了。"""
     assert Config().market_admins == []
+    assert Config().rename_admins == []
     assert Config.from_plugin_config({}).market_admins == []
+    assert Config.from_plugin_config({}).rename_admins == []
     assert Config.from_plugin_config({"market_admins": None}).market_admins == []
+    assert Config.from_plugin_config({"rename_admins": None}).rename_admins == []
     assert Config.from_plugin_config({"market_admins": [" 10001 ", ""]}).market_admins == ["10001"]
+    assert Config.from_plugin_config({"rename_admins": [" 10002 ", ""]}).rename_admins == ["10002"]
 
 
 def test_fee_rounds_up() -> None:

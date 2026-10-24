@@ -109,7 +109,7 @@ class StockMarketPlugin(Star):
         return str(event.get_group_id()) in cfg.allowed_groups
 
     def _is_market_admin(self, event: AstrMessageEvent, cfg: Config) -> bool:
-        """股市自己的管理员名单：只看插件配置，与 AstrBot 管理员/群管理身份无关。"""
+        """give / clear 白名单：只看插件配置，与 AstrBot 管理员/群管理身份无关。"""
         return str(self._user(event)) in set(cfg.market_admins)
 
     def _require_market_admin(self, event: AstrMessageEvent, cfg: Config, action: str) -> None:
@@ -120,6 +120,19 @@ class StockMarketPlugin(Star):
                 f"没有配置股市管理员，无法{action}。请在插件配置的「股市管理员 QQ 名单」里填写。"
             )
         raise MarketError(f"你不是股市管理员，无法{action}。")
+
+    def _is_rename_admin(self, event: AstrMessageEvent, cfg: Config) -> bool:
+        """改名白名单：与 give/clear 名单、AstrBot 管理员完全独立。"""
+        return str(self._user(event)) in set(cfg.rename_admins)
+
+    def _require_rename_admin(self, event: AstrMessageEvent, cfg: Config) -> None:
+        if self._is_rename_admin(event, cfg):
+            return
+        if not cfg.rename_admins:
+            raise MarketError(
+                "没有配置改名管理员，无法改名。请在插件配置的「改名管理员 QQ 名单」里填写。"
+            )
+        raise MarketError("你不是改名管理员，无法改名。")
 
     @staticmethod
     def _sender_name(event: AstrMessageEvent) -> str:
@@ -478,7 +491,7 @@ class StockMarketPlugin(Star):
         return event.image_result(str(out))
 
     async def _cmd_rename(self, event, namespace, cfg, rest):
-        self._require_market_admin(event, cfg, "改名")
+        self._require_rename_admin(event, cfg)
         if len(rest) < 2:
             raise MarketError(USAGE["改名"])
         code = rest[0].upper()
