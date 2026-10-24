@@ -107,7 +107,7 @@ def help_text(cfg: Config) -> str:
         f"总资产低于 {fmt_money(cfg.relief_threshold)} 元可领补助，{cfg.relief_cooldown_hours} 小时一次。\n"
         "转账免手续费，双方需已开户。\n"
         f"db 是纯随机赌博（下注 X 元，回报 0～2X 均匀随机）；"
-        f"抢劫只抢对方可用资金的 {cfg.rob_min_pct:g}%～{cfg.rob_max_pct:g}%，"
+        f"抢劫只抢对方可用资金 {cfg.rob_min_pct:g}%～{cfg.rob_max_pct:g}%（成功率按双方可用资金差计算），"
         f"失败会被反抢，{cfg.rob_cooldown_minutes} 分钟冷却。\n"
         "无主动推送，请用挂单、成交、新闻查询结果。"
     )

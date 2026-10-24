@@ -715,10 +715,9 @@ def rob(
         remain = max(1, int((cooldown - (now - last)) // 60) + 1)
         raise MarketError(f"抢劫冷却中，还需约 {remain} 分钟。")
 
-    my_total = account_total(state, acc)
-    their_total = account_total(state, target_acc)
-    # 资产先换算成「元」再比较，与 DDBOT 按积分算的口径一致
-    chance = float(cfg.rob_base_chance) + ((my_total - their_total) / 100.0) / 50.0
+    # 以双方「可用资金」为基准（元）比较：抢劫只抢现金，持仓市值不参与概率计算
+    my_cash = int(acc.get("cash", 0))
+    chance = float(cfg.rob_base_chance) + ((my_cash - target_cash) / 100.0) / 50.0
     chance = max(25.0, min(75.0, chance))
     success = _sysrand.randint(1, 100) <= chance
 

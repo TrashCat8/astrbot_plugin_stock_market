@@ -426,6 +426,22 @@ def test_rob_guards() -> None:
         raise AssertionError("目标资金不足 10 元应拒绝")
 
 
+def test_rob_chance_uses_available_cash() -> None:
+    """成功率按双方「可用资金」差计算，持仓市值不参与。"""
+    state = fresh()
+    a = engine.ensure_account(state, "u1", CFG)
+    b = engine.ensure_account(state, "u2", CFG)
+    a["cash"], b["cash"] = 1_000_000, 2_000_000  # 1 万 / 2 万元
+    # u1 持仓市值 1 万元，但现金只有 1 万；若按总资产算概率会明显不同
+    a["positions"]["ST001"] = {"shares": 1000, "cost": 1_000_000}
+    now = 1_700_000_000.0
+    a["last_rob"] = 0
+    info = engine.rob(state, "u1", "u2", CFG, now)
+    expected = max(25.0, min(75.0, CFG.rob_base_chance + ((1_000_000 - 2_000_000) / 100.0) / 50.0))
+    assert info["chance"] == expected, info
+    assert info["chance"] == 25.0, info
+
+
 def test_rob_amount_range_and_cooldown() -> None:
     state = fresh()
     a = engine.ensure_account(state, "u1", CFG)

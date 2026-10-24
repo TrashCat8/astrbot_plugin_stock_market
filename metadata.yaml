@@ -8,7 +8,7 @@ desc: |
   本插件为 AI 辅助创作（由 Claude 协助编写、作者验收），详见仓库 README 的「AI 辅助创作说明」。
 author: TrashCat8
 repo: https://github.com/TrashCat8/astrbot_plugin_stock_market
-version: 1.0.2
+version: 1.0.3
 astrbot_version: ">=4.9.2"
 support_platforms:
   - aiocqhttp
