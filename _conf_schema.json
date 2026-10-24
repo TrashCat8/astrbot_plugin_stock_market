@@ -1,0 +1,146 @@
+{
+  "initial_capital": {
+    "description": "开户初始资金（元）",
+    "type": "float",
+    "default": 100000.0,
+    "hint": "每个群每个用户开户时获得的虚拟资金，不影响任何真实资产。"
+  },
+  "round_seconds": {
+    "description": "行情轮次间隔（秒）",
+    "type": "int",
+    "default": 300,
+    "hint": "每过这么多秒行情推进一轮，每轮涨跌幅度受限。不会开后台定时任务，按需补算。"
+  },
+  "max_change_pct": {
+    "description": "每轮最大涨跌幅（%）",
+    "type": "float",
+    "default": 10.0,
+    "hint": "单轮价格波动上限，包含新闻带来的影响。"
+  },
+  "fee_rate": {
+    "description": "买卖手续费率",
+    "type": "float",
+    "default": 0.001,
+    "hint": "0.001 表示 0.1%，按成交额计算，向上取整到分，买入卖出各收一次。"
+  },
+  "order_ttl_hours": {
+    "description": "限价单有效期（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "到期未成交的挂单会自动撤销并退回冻结的资金或股份。"
+  },
+  "news_probability": {
+    "description": "每轮生成新闻的概率",
+    "type": "float",
+    "default": 0.35,
+    "hint": "0 表示关闭新闻系统；新闻会影响对应股票当轮的涨跌。"
+  },
+  "max_catchup_rounds": {
+    "description": "单次最多补算轮数",
+    "type": "int",
+    "default": 500,
+    "hint": "长期无人使用后，一次性最多补算这么多轮，避免卡顿。"
+  },
+  "page_size": {
+    "description": "行情每页股票数量",
+    "type": "int",
+    "default": 10,
+    "hint": "行情卡片一页显示多少只股票。"
+  },
+  "render_cards": {
+    "description": "使用图片卡片输出",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后行情、持仓、走势、帮助改为纯文字输出。"
+  },
+  "allowed_groups": {
+    "description": "允许使用的群号白名单",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "留空表示不限制；填写后只有白名单内的群可以使用，私聊不受限制。"
+  },
+  "daily_bonus": {
+    "description": "每日签到基础奖励（元）",
+    "type": "float",
+    "default": 2000.0,
+    "hint": "每天签到的保底金额，连续签到在此基础上叠加加成。"
+  },
+  "streak_bonus_pct": {
+    "description": "连续签到每天的加成（%）",
+    "type": "float",
+    "default": 10.0,
+    "hint": "连续第 N 天加成 = (N-1) × 本值，受下面的上限约束。"
+  },
+  "max_streak_bonus_pct": {
+    "description": "连续签到加成上限（%）",
+    "type": "float",
+    "default": 50.0,
+    "hint": "连续签到奖励的封顶比例。"
+  },
+  "relief_threshold": {
+    "description": "破产补助的资产线（元）",
+    "type": "float",
+    "default": 5000.0,
+    "hint": "总资产低于这个数值才能领取补助。"
+  },
+  "relief_amount": {
+    "description": "破产补助金额（元）",
+    "type": "float",
+    "default": 10000.0,
+    "hint": "每次补助发放的金额。"
+  },
+  "relief_cooldown_hours": {
+    "description": "破产补助冷却（小时）",
+    "type": "int",
+    "default": 24,
+    "hint": "两次补助之间的最短间隔。"
+  },
+  "rank_size": {
+    "description": "资产排行默认人数",
+    "type": "int",
+    "default": 10,
+    "hint": "不写参数时「/股市 排行」显示前多少名，最大 50。"
+  },
+  "rob_cooldown_minutes": {
+    "description": "抢劫冷却（分钟）",
+    "type": "int",
+    "default": 10,
+    "hint": "每次抢劫尝试后的冷却时间，失败也计算。"
+  },
+  "rob_base_chance": {
+    "description": "抢劫基础成功率（%）",
+    "type": "float",
+    "default": 40.0,
+    "hint": "再按双方总资产差值修正，最终夹在 25%～75% 之间。"
+  },
+  "rob_min_pct": {
+    "description": "抢劫最少抢走比例（%）",
+    "type": "float",
+    "default": 5.0,
+    "hint": "按目标可用资金计算，低值和高值会自动排序。"
+  },
+  "rob_max_pct": {
+    "description": "抢劫最多抢走比例（%）",
+    "type": "float",
+    "default": 20.0,
+    "hint": "失败时反被抢走的比例也用这个区间。"
+  },
+  "market_admins": {
+    "description": "股市管理员 QQ 名单（仅 give / clear 生效）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "与 AstrBot 的管理员名单、群管理身份完全独立：不在此名单内（即使群主/群管理/AstrBot 管理员）也不能用 give 和 clear。默认空列表，留空表示谁都不能用，需要自己填 QQ 号。"
+  },
+  "gamble_enabled": {
+    "description": "开启赌博玩法（/股市 db）",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后 /股市 db 会提示本群未开启。"
+  }
+}

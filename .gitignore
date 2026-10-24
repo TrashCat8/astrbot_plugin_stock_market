@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[co]
+
+# 运行时缓存（插件会写 data/plugin_data，不在插件目录）
+cache/
+*.log
