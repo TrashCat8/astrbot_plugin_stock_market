@@ -373,7 +373,13 @@ def test_name_store_shared_across_groups() -> None:
     import asyncio
     import tempfile
 
-    from market.storage import NameStore
+    try:
+        # storage 按上架规范从 astrbot.api 取 logger，纯离线环境没有 astrbot 就跳过；
+        # 该行为在容器冒烟测试（tests/smoke_handlers.py）里仍会被覆盖。
+        from market.storage import NameStore
+    except ImportError as exc:
+        print(f"SKIP  test_name_store_shared_across_groups（需要 AstrBot 环境：{exc}）")
+        return
 
     base = Path(tempfile.mkdtemp(prefix="stock_names_"))
     store = NameStore(base)
