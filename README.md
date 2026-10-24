@@ -1,3 +1,5 @@
+<p align="center"><img src="logo.png" width="128" alt="logo"></p>
+
 # astrbot_plugin_stock_market（群内模拟股市）
 
 群友用虚拟资金炒股：开户、看行情、买卖、挂限价单、看新闻和走势。每个群（私聊则每个用户）
