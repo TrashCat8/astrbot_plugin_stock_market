@@ -120,6 +120,15 @@ async def main() -> int:
         failures.append("give权限")
         print("FAIL AstrBot 管理员不应自动获得股市管理员权限")
 
+    # 改名同样只看股市管理员名单
+    try:
+        await plugin._cmd_rename(FakeEvent(uid="10003", admin=True), namespace, cfg, ["ST002", "测试名"])
+    except Exception as exc:  # noqa: BLE001
+        print(f"OK   改名权限拒绝: {exc}")
+    else:
+        failures.append("改名权限")
+        print("FAIL AstrBot 管理员不应自动获得改名权限")
+
     # 别名解析：走真实入口，确认「/股市 transfer ...」能分发到 transfer
     async for res in plugin.market(event, "transfer 10003 1"):
         check("指令分发 transfer", res)

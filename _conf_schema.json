@@ -129,13 +129,13 @@
     "hint": "失败时反被抢走的比例也用这个区间。"
   },
   "market_admins": {
-    "description": "股市管理员 QQ 名单（仅 give / clear 生效）",
+    "description": "股市管理员 QQ 名单（改名 / give / clear 生效）",
     "type": "list",
     "default": [],
     "items": {
       "type": "string"
     },
-    "hint": "与 AstrBot 的管理员名单、群管理身份完全独立：不在此名单内（即使群主/群管理/AstrBot 管理员）也不能用 give 和 clear。默认空列表，留空表示谁都不能用，需要自己填 QQ 号。"
+    "hint": "与 AstrBot 的管理员名单、群管理身份完全独立：不在此名单内（即使群主/群管理/AstrBot 管理员）也不能用 改名、give 和 clear。默认空列表，留空表示谁都不能用，需要自己填 QQ 号。"
   },
   "gamble_enabled": {
     "description": "开启赌博玩法（/股市 db）",

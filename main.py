@@ -61,7 +61,7 @@ USAGE = {
     "卖单": "用法：/股市 卖单 ST001 100 12.00",
     "撤单": "用法：/股市 撤单 1",
     "走势": "用法：/股市 走势 ST001",
-    "改名": "用法：/股市 改名 ST001 星辰科技",
+    "改名": "用法：/股市 改名 ST001 星辰科技（需股市管理员）",
     "db": "用法：/股市 db 1000（下注 1000 元）",
     "抢劫": "用法：/股市 抢劫 @对方，或 /股市 抢劫 QQ号",
     "transfer": "用法：/股市 transfer @对方 1000，或 /股市 transfer QQ号 1000",
@@ -107,15 +107,6 @@ class StockMarketPlugin(Star):
         if not cfg.allowed_groups:
             return True
         return str(event.get_group_id()) in cfg.allowed_groups
-
-    def _is_admin(self, event: AstrMessageEvent) -> bool:
-        if event.is_admin():
-            return True
-        try:
-            admins = self.context.get_config().get("admins_id", []) or []
-        except Exception:
-            return False
-        return str(event.get_sender_id()) in {str(item) for item in admins}
 
     def _is_market_admin(self, event: AstrMessageEvent, cfg: Config) -> bool:
         """股市自己的管理员名单：只看插件配置，与 AstrBot 管理员/群管理身份无关。"""
@@ -487,8 +478,7 @@ class StockMarketPlugin(Star):
         return event.image_result(str(out))
 
     async def _cmd_rename(self, event, namespace, cfg, rest):
-        if not self._is_admin(event):
-            raise MarketError("只有管理员可以给股票改名。")
+        self._require_market_admin(event, cfg, "改名")
         if len(rest) < 2:
             raise MarketError(USAGE["改名"])
         code = rest[0].upper()
