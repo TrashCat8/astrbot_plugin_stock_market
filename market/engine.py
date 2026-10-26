@@ -118,19 +118,27 @@ def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
     if item:
         stock = state["stocks"].get(item["code"])
         if stock and stock["price"] > 0:
-            impacts[item["code"]] = item["pct"] / 100.0
+            impacts[item["code"]] = math.log1p(item["pct"] / 100.0)
 
     limit = cfg.max_change_pct / 100.0
+    # 对数空间取对称区间 [-log(1+limit), +log(1+limit)]，几何均值不变（长期无漂移），
+    # exp 后正好落在 [prev/(1+limit), prev*(1+limit)]，满足「单轮涨跌 ≤ limit」。
+    log_up = math.log1p(limit)
+    log_down = -log_up
+    up = 1.0 + limit
+    down = 1.0 / up
     for code, stock in state["stocks"].items():
         rng = random.Random(f"{state['group']}:{code}:{round_no}")
-        base = rng.uniform(-limit, limit)
+        base = rng.uniform(log_down, log_up)
         delta = base + impacts.get(code, 0.0)
-        delta = max(-limit, min(limit, delta))
+        delta = max(log_down, min(log_up, delta))
 
+        # 乘数用 exp(δ)（对数正态）而不是 1+δ：后者算术均值虽为 1，几何均值却小于 1，
+        # 长期会系统性阴跌（波动拖累），让股票集体沉到低价区。
         prev = int(stock["price"])
-        low = max(1, int(math.ceil(prev * (1 - limit))))
-        high = max(low, int(math.floor(prev * (1 + limit))))
-        price = int(round(prev * (1 + delta)))
+        low = max(cfg.min_price, int(math.ceil(prev * down)))
+        high = max(low, int(math.floor(prev * up)))
+        price = int(round(prev * math.exp(delta)))
         price = max(low, min(high, price))
 
         stock["prev"] = prev

@@ -13,6 +13,7 @@ class Config:
     initial_capital: int = 10_000_000  # 100,000.00 元
     round_seconds: int = 300
     max_change_pct: float = 10.0
+    min_price: int = 10  # 0.10 元：整数分精度下再低就会锁死在原地
     fee_rate: float = 0.001
     order_ttl_hours: int = 24
     max_catchup: int = 500
@@ -76,6 +77,7 @@ class Config:
             initial_capital=max(0, int(round(num("initial_capital", 100000.0, float) * 100))),
             round_seconds=max(30, num("round_seconds", 300, int)),
             max_change_pct=min(50.0, max(1.0, num("max_change_pct", 10.0, float))),
+            min_price=min(10_000, max(1, int(round(num("min_price", 0.10, float) * 100)))),
             fee_rate=min(0.1, max(0.0, num("fee_rate", 0.001, float))),
             order_ttl_hours=max(1, num("order_ttl_hours", 24, int)),
             max_catchup=max(1, num("max_catchup_rounds", 500, int)),

@@ -105,7 +105,7 @@ def help_text(cfg: Config) -> str:
         "/股市 db 1000 · 抢劫 @对方\n"
         "/股市 transfer @对方 1000\n\n"
         f"开户 {fmt_money(cfg.initial_capital)} 元；每 {cfg.round_seconds} 秒更新，"
-        f"每轮涨跌 ≤{cfg.max_change_pct:g}%。\n"
+        f"每轮涨跌 ≤{cfg.max_change_pct:g}%，股价不会跌破 {fmt_money(cfg.min_price)} 元。\n"
         f"买卖手续费各 {cfg.fee_rate * 100:.3f}%（向上取整到分），全天交易，整数股，不支持做空。\n"
         f"杠杆最高 {cfg.max_leverage:g} 倍，欠款日息 {cfg.margin_daily_rate * 100:.3f}%，"
         f"权益/市值低于 {cfg.margin_call_ratio * 100:.0f}% 自动强平；"

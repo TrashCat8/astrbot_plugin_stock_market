@@ -52,8 +52,11 @@ def main() -> int:
             "capital": engine.fmt_money(cfg.initial_capital),
             "round": str(cfg.round_seconds),
             "max_pct": f"{cfg.max_change_pct:g}",
+            "floor": engine.fmt_money(cfg.min_price),
             "fee": f"{cfg.fee_rate * 100:.3f}",
             "ttl": str(cfg.order_ttl_hours),
+            "daily": engine.fmt_money(cfg.daily_bonus),
+            "relief": engine.fmt_money(cfg.relief_threshold),
         },
         out=out_dir / "help.png",
     )

@@ -369,6 +369,39 @@ def test_rename() -> None:
     assert engine.find_stock(state, "星辰科技")["code"] == "ST001"
 
 
+def test_price_walks_without_long_term_drift() -> None:
+    """乘数改用 exp(δ) 后对数价格无漂移，长时间跑下来中位数不会整体沉底。"""
+    cfg = Config(news_probability=0.0)
+    prices: list[int] = []
+    for g in range(12):
+        state = engine.new_state(f"drift_{g}", 0.0, cfg)
+        for round_no in range(1, 601):
+            engine._apply_round(state, round_no, cfg)
+        prices.extend(int(stock["price"]) for stock in state["stocks"].values())
+    prices.sort()
+    seeds = sorted(int(item["price"]) for item in engine.SEED_STOCKS)
+    mid_end = prices[len(prices) // 2]
+    mid_start = seeds[len(seeds) // 2]
+    assert 0.6 * mid_start <= mid_end <= 1.6 * mid_start, (mid_start, mid_end)
+
+
+def test_price_floor_not_stuck() -> None:
+    """低于最低价的老数据会被拉回地板，且在地板上仍能继续涨，不会变成新的固定点。"""
+    cfg = Config(news_probability=0.0)
+    assert cfg.min_price == 10
+    state = engine.new_state("floor", 0.0, cfg)
+    stock = state["stocks"]["ST003"]
+    stock["price"] = 9  # 旧版本里卡死在 0.09 元的数据
+    seen = set()
+    for round_no in range(1, 201):
+        engine._apply_round(state, round_no, cfg)
+        price = int(stock["price"])
+        assert price >= cfg.min_price, (round_no, price)
+        seen.add(price)
+    assert max(seen) > cfg.min_price, seen
+    assert len(seen) > 3, seen
+
+
 def test_name_store_shared_across_groups() -> None:
     import asyncio
     import tempfile
