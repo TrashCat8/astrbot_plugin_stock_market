@@ -986,7 +986,7 @@ def gamble(state: dict[str, Any], user: str, amount_text: Any, cfg: Config) -> d
         raise MarketError(f"可用资金不足：当前可用 {fmt_money(cash)} 元。")
 
     if bet == cash:
-        # 全仓沿用 DDBOT 规则：80% 翻倍，20% 归零
+        # 全仓押注按特殊规则结算：80% 翻倍，20% 归零
         payout = bet * 2 if _sysrand.randint(1, 5) != 1 else 0
     else:
         payout = _sysrand.randint(0, bet * 2)
@@ -1120,7 +1120,7 @@ def transfer(
 def give(
     state: dict[str, Any], user: str, target: Any, amount_text: Any, cfg: Config
 ) -> dict[str, Any]:
-    """管理员凭空发钱（发起人账户不变，与 DDBOT 的 addScore 行为一致）。
+    """管理员凭空发钱（发起人账户不变，与积分加分的语义一致）。
 
     钱是凭空产生的，不是在账户间移动，所以给自己发钱也允许。
     """
