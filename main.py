@@ -45,6 +45,8 @@ ALIASES = {
     "走势": "chart",
     "帮助": "help",
     "改名": "rename",
+    "复牌": "relist",
+    "重新上市": "relist",
     "签到": "checkin",
     "排行": "rank",
     "盈亏": "profit",
@@ -71,6 +73,7 @@ USAGE = {
     "撤单": "用法：/股市 撤单 1",
     "走势": "用法：/股市 走势 ST001",
     "改名": "用法：/股市 改名 ST001 星辰科技（需股市管理员）",
+    "复牌": "用法：/股市 复牌 ST003 [价格]，不填价格按默认复牌价（需股市管理员）",
     "db": "用法：/股市 db 1000（下注 1000 元）",
     "抢劫": "用法：/股市 抢劫 @对方，或 /股市 抢劫 QQ号",
     "transfer": "用法：/股市 transfer @对方 1000，或 /股市 transfer QQ号 1000",
@@ -546,9 +549,16 @@ class StockMarketPlugin(Star):
         if not trades:
             return event.plain_result("还没有成交记录。")
         lines = ["【我的最近成交】"]
+        kinds = {
+            "market": "市价",
+            "limit": "限价",
+            "margin": "融资",
+            "liquidate": "强平",
+            "delist": "退市清盘",
+        }
         for trade in reversed(trades):
             side = "买入" if trade["side"] == "buy" else "卖出"
-            kind = "市价" if trade["kind"] == "market" else "限价"
+            kind = kinds.get(trade["kind"], "限价")
             lines.append(
                 f"{engine.fmt_time(trade['ts'])} {side}{kind} {trade['code']} "
                 f"{trade['shares']} 股 @ {engine.fmt_money(trade['price'], comma=False)} 元 "
@@ -594,6 +604,22 @@ class StockMarketPlugin(Star):
             logger.exception("[stock] 走势卡渲染失败，回退文字")
             return event.plain_result(text)
         return event.image_result(str(out))
+
+    async def _cmd_relist(self, event, namespace, cfg, rest):
+        self._require_market_admin(event, cfg, "复牌")
+        if not rest:
+            raise MarketError(USAGE["复牌"])
+        user = self._user(event)
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            self._mark_name(event, state, user)
+            info = engine.relist(state, rest[0], rest[1] if len(rest) > 1 else "", cfg)
+
+        return event.plain_result(
+            f"已复牌：{info['label']}\n"
+            f"起售价 {engine.fmt_money(info['price'], comma=False)} 元"
+            f"（退市线 {engine.fmt_money(cfg.delist_price)} 元），行情从下一轮继续。"
+        )
 
     async def _cmd_rename(self, event, namespace, cfg, rest):
         self._require_rename_admin(event, cfg)
@@ -849,6 +875,7 @@ class StockMarketPlugin(Star):
             "round": str(cfg.round_seconds),
             "max_pct": f"{cfg.max_change_pct:g}",
             "floor": engine.fmt_money(cfg.min_price),
+            "delist_rule": textfmt.delist_rule_text(cfg),
             "fee": f"{cfg.fee_rate * 100:.3f}",
             "ttl": str(cfg.order_ttl_hours),
             "daily": engine.fmt_money(cfg.daily_bonus),
@@ -867,9 +894,15 @@ class StockMarketPlugin(Star):
     def _detail_text(stock: dict[str, Any]) -> str:
         pct = engine.stock_pct(stock)
         history = [int(p) for _, p in stock.get("history", [])] or [int(stock["price"])]
-        return (
+        text = (
             f"{engine.display_label(stock)}\n"
             f"现价 {engine.fmt_money(stock['price'], comma=False)} 元 {engine.fmt_pct(pct)}\n"
             f"区间最高 {engine.fmt_money(max(history), comma=False)} 元 · "
             f"最低 {engine.fmt_money(min(history), comma=False)} 元"
         )
+        if engine.is_delisted(stock):
+            text += (
+                "\n状态 已退市（停牌），持仓已按退市价强制平仓；"
+                f"管理员可用「/股市 复牌 {stock['code']}」恢复交易。"
+            )
+        return text

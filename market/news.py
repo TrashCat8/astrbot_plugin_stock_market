@@ -34,7 +34,11 @@ def maybe_generate(state: dict[str, Any], round_no: int, cfg: Config) -> dict[st
     if rng.random() >= cfg.news_probability:
         return None
 
-    code = rng.choice(list(state["stocks"]))
+    # 退市停牌的股票不再出新闻（价格已凝固，新闻也不会影响它）
+    tradable = [c for c, s in state["stocks"].items() if not s.get("delisted")]
+    if not tradable:
+        return None
+    code = rng.choice(tradable)
     stock = state["stocks"][code]
     name = stock.get("name") or code
     positive = rng.random() < 0.5

@@ -171,6 +171,11 @@ def render_quote(
         draw.text((44, y), row["code"], font=_font(19, True), fill=TEXT, anchor="lm")
         name = row.get("name") or "—"
         draw.text((146, y), name, font=_font(19), fill=TEXT, anchor="lm")
+        if row.get("delisted"):
+            # 停牌股票价格凝固，用灰字标注，不显示涨跌
+            draw.text((566, y), _price(row["price"]), font=_font(21, True), fill=DIM, anchor="rm")
+            draw.text((716, y), "已退市", font=_font(18, True), fill=MUTED, anchor="rm")
+            continue
         draw.text((566, y), _price(row["price"]), font=_font(21, True), fill=TEXT, anchor="rm")
         pct = float(row.get("pct", 0.0))
         draw.text((716, y), f"{pct:+.2f}%", font=_font(19, True), fill=_pct_color(pct), anchor="rm")
@@ -539,6 +544,7 @@ _HELP_LINES: list[tuple[str, str]] = [
     ("/股市 transfer @对方 1000", "cmd"),
     ("", "gap"),
     ("开户 {capital} 元；每 {round} 秒更新，每轮涨跌 ≤{max_pct}%，股价不会跌破 {floor} 元。", "text"),
+    ("退市：{delist_rule}", "text"),
     ("买卖手续费各 {fee}%（向上取整到分），全天交易，整数股，不支持做空借贷。", "text"),
     ("限价单冻结资金/股份，{ttl} 小时失效；达到限价即按当时更优报价全额成交，可撤销未成交单。", "text"),
     ("签到每天一次（基础 {daily} 元，连续签到有加成）；总资产低于 {relief} 元可领补助。", "text"),

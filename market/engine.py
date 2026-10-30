@@ -128,6 +128,9 @@ def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
     up = 1.0 + limit
     down = 1.0 / up
     for code, stock in state["stocks"].items():
+        # 已退市的股票停牌，价格凝固在退市价，等管理员复牌
+        if is_delisted(stock):
+            continue
         rng = random.Random(f"{state['group']}:{code}:{round_no}")
         base = rng.uniform(log_down, log_up)
         delta = base + impacts.get(code, 0.0)
@@ -148,14 +151,147 @@ def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
         if len(history) > MAX_HISTORY:
             del history[: len(history) - MAX_HISTORY]
 
+        if cfg.delist_enabled:
+            # 低于退市线才累计；中途回到线上就重新计数
+            if price < cfg.delist_price:
+                stock["below_rounds"] = int(stock.get("below_rounds", 0)) + 1
+            else:
+                stock["below_rounds"] = 0
+
+    if cfg.delist_enabled:
+        for stock in state["stocks"].values():
+            if is_delisted(stock):
+                continue
+            if int(stock.get("below_rounds", 0)) >= cfg.delist_rounds:
+                _delist(state, stock, round_no, cfg)
+
     _process_orders(state, round_no, cfg)
+
+
+def _delist(
+    state: dict[str, Any], stock: dict[str, Any], round_no: int, cfg: Config
+) -> dict[str, Any]:
+    """退市清盘：撤销该股全部挂单，所有持仓按最后价强制卖出。
+
+    与强平的区别在于这是「公司没了」，之后股票停牌、价格凝固，
+    只有管理员用 /股市 复牌 才能恢复交易。
+    """
+    code = stock["code"]
+    price = int(stock["price"])
+
+    cancelled = 0
+    for oid, order in list(state.get("orders", {}).items()):
+        if order.get("code") != code:
+            continue
+        _refund_order(state, order)
+        state["orders"].pop(oid, None)
+        cancelled += 1
+
+    holders = 0
+    for user, acc in list((state.get("accounts") or {}).items()):
+        pos = position_of(acc, code)
+        if pos is None:
+            continue
+        # 挂单已撤，冻结股回到持仓，这里整仓卖出
+        shares = int(pos.get("shares", 0))
+        if shares <= 0:
+            continue
+        pos["frozen"] = 0
+        result = _settle_sale(acc, pos, shares, price, cfg)
+        _record_trade(state, user, "delist", "sell", code, shares, price, result["fee"])
+        holders += 1
+        text = (
+            f"📉 退市清盘：{display_label(stock)} 连续 {cfg.delist_rounds} 轮低于 "
+            f"{fmt_money(cfg.delist_price)} 元，你的 {shares} 股已按 "
+            f"{fmt_money(price, comma=False)} 元强制卖出，到账 {fmt_money(result['proceeds'])} 元。"
+        )
+        if result["repay"] > 0:
+            text += f"其中 {fmt_money(result['repay'])} 元已偿还欠款。"
+        left = int(acc.get("debt", 0))
+        if left > 0:
+            text += f"剩余欠款 {fmt_money(left)} 元，后续收入会自动优先还债。"
+        notices = acc.setdefault("notices", [])
+        notices.append(text)
+        if len(notices) > 5:
+            del notices[: len(notices) - 5]
+
+    stock["delisted"] = True
+    stock["delisted_round"] = round_no
+    stock["delisted_at"] = int(state["epoch"]) + round_no * cfg.round_seconds
+    stock["below_rounds"] = 0
+
+    news = state.setdefault("news", [])
+    news.append(
+        {
+            "round": round_no,
+            "ts": stock["delisted_at"],
+            "code": code,
+            "pct": 0.0,
+            "text": (
+                f"【退市】{display_label(stock)} 连续 {cfg.delist_rounds} 轮低于 "
+                f"{fmt_money(cfg.delist_price)} 元，已退市并强制平仓，等待管理员复牌。"
+            ),
+        }
+    )
+    if len(news) > news_mod.MAX_NEWS:
+        del news[: len(news) - news_mod.MAX_NEWS]
+
+    return {"stock": stock, "price": price, "cancelled": cancelled, "holders": holders}
+
+
+def relist(
+    state: dict[str, Any], key: str, price_text: Any, cfg: Config
+) -> dict[str, Any]:
+    """管理员复牌：解除停牌，从指定价格（默认 relist_price）重新开始交易。"""
+    stock = find_stock(state, key)
+    if not is_delisted(stock):
+        raise MarketError(f"{display_label(stock)} 没有退市，无需复牌。")
+
+    text = str(price_text or "").strip()
+    price = _check_price(text) if text else max(cfg.relist_price, cfg.min_price)
+    if price <= cfg.delist_price:
+        raise MarketError(
+            f"复牌价必须高于退市线 {fmt_money(cfg.delist_price)} 元，否则下一轮就会重新退市。"
+        )
+
+    round_no = int(state["round"])
+    stock["delisted"] = False
+    stock.pop("delisted_round", None)
+    stock["relisted_round"] = round_no
+    stock["price"] = price
+    stock["prev"] = price
+    stock["below_rounds"] = 0
+    history = stock.setdefault("history", [])
+    history.append([round_no, price])
+    if len(history) > MAX_HISTORY:
+        del history[: len(history) - MAX_HISTORY]
+
+    news = state.setdefault("news", [])
+    news.append(
+        {
+            "round": round_no,
+            "ts": int(time.time()),
+            "code": stock["code"],
+            "pct": 0.0,
+            "text": (
+                f"【复牌】{display_label(stock)} 恢复交易，起售价 "
+                f"{fmt_money(price, comma=False)} 元。"
+            ),
+        }
+    )
+    if len(news) > news_mod.MAX_NEWS:
+        del news[: len(news) - news_mod.MAX_NEWS]
+
+    return {"stock": stock, "label": display_label(stock), "price": price}
 
 
 def _process_orders(state: dict[str, Any], round_no: int, cfg: Config) -> None:
     orders = sorted(state.get("orders", {}).values(), key=lambda o: int(o["id"]))
     for order in orders:
         stock = state["stocks"].get(order["code"])
-        if stock is None:
+        if stock is None or is_delisted(stock):
+            # 退市时挂单已在 _delist 里撤掉，这里再兜一层，避免停牌价成交
+            _refund_order(state, order)
             state["orders"].pop(str(order["id"]), None)
             continue
         if round_no > int(order["expire_round"]):
@@ -228,6 +364,18 @@ def find_stock(state: dict[str, Any], key: str) -> dict[str, Any]:
         if candidate.get("name") and candidate["name"] == key:
             return candidate
     raise MarketError(f"没有找到股票「{key}」。")
+
+
+def is_delisted(stock: dict[str, Any]) -> bool:
+    return bool(stock.get("delisted"))
+
+
+def require_tradable(stock: dict[str, Any]) -> None:
+    if is_delisted(stock):
+        raise MarketError(
+            f"{display_label(stock)} 已退市停牌，无法交易；等管理员用"
+            f"「/股市 复牌 {stock['code']}」恢复。"
+        )
 
 
 def stock_pct(stock: dict[str, Any]) -> float:
@@ -361,6 +509,7 @@ def _record_trade(
 
 def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -> dict[str, Any]:
     stock = find_stock(state, key)
+    require_tradable(stock)
     count = _check_shares(shares)
     acc = require_account(state, user)
 
@@ -393,6 +542,7 @@ def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) ->
 
 def sell(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -> dict[str, Any]:
     stock = find_stock(state, key)
+    require_tradable(stock)
     count = _check_shares(shares)
     acc = require_account(state, user)
 
@@ -451,6 +601,7 @@ def leverage_buy(
     if not cfg.margin_enabled:
         raise MarketError("本群没有开启杠杆玩法。")
     stock = find_stock(state, key)
+    require_tradable(stock)
     count = _check_shares(shares)
     leverage = _parse_leverage(leverage_text, cfg)
     acc = require_account(state, user)
@@ -515,6 +666,7 @@ def place_order(
     cfg: Config,
 ) -> dict[str, Any]:
     stock = find_stock(state, key)
+    require_tradable(stock)
     count = _check_shares(shares)
     limit = _check_price(price_text)
     acc = require_account(state, user)
@@ -728,7 +880,7 @@ def _check_liquidations(state: dict[str, Any], now: float, cfg: Config) -> None:
             if debt <= 0 or shares <= 0:
                 continue
             stock = state["stocks"].get(code)
-            if stock is None:
+            if stock is None or is_delisted(stock):
                 continue
             price = int(stock["price"])
             value = price * shares
@@ -1181,6 +1333,7 @@ def quote_page(
                 "name": stock.get("name") or "",
                 "price": int(stock["price"]),
                 "pct": stock_pct(stock),
+                "delisted": is_delisted(stock),
             }
         )
     return rows, page, pages

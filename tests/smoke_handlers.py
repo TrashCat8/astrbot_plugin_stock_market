@@ -161,6 +161,29 @@ async def main() -> int:
     if not data_file.exists():
         failures.append("账本落盘")
 
+    # 退市/复牌：直接改账本标记 ST001 退市，确认行情卡与详情文字都能展示，再走管理员复牌
+    saved = json.loads(data_file.read_text(encoding="utf-8"))
+    saved["stocks"]["ST001"]["delisted"] = True
+    saved["stocks"]["ST001"]["delisted_round"] = int(saved["round"])
+    saved["stocks"]["ST001"]["price"] = 30
+    saved["stocks"]["ST001"]["prev"] = 30
+    data_file.write_text(json.dumps(saved, ensure_ascii=False), encoding="utf-8")
+    check("行情(退市)", await call("quote"), "image")
+    detail = await call("quote", "ST001")
+    check("退市详情", detail)
+    if "已退市" not in detail.get("text", ""):
+        failures.append("退市详情")
+        print("FAIL 退市股票详情应标注已退市")
+    try:
+        await call("buy", "ST001", "10")
+    except Exception as exc:  # noqa: BLE001
+        print(f"OK   退市禁买: {exc}")
+    else:
+        failures.append("退市禁买")
+        print("FAIL 退市股票不应还能买入")
+    check("复牌", await plugin._cmd_relist(event, namespace, cfg, ["ST001"]))
+    print("OK   复牌后详情: " + (await call("quote", "ST001")).get("text", "").splitlines()[0])
+
     # 第二个群：股票名称全局共享，账本仍然独立
     event_b = FakeEvent(gid="654321", uid="10002", admin=True)
     check("B群开户", await plugin._cmd_open(event_b, "group_654321", cfg, []))

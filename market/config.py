@@ -14,6 +14,11 @@ class Config:
     round_seconds: int = 300
     max_change_pct: float = 10.0
     min_price: int = 10  # 0.10 元：整数分精度下再低就会锁死在原地
+    # 退市：连续 delist_rounds 轮低于 delist_price 即停牌，持仓按最后价强制平仓
+    delist_enabled: bool = True
+    delist_price: int = 50  # 0.50 元
+    delist_rounds: int = 72  # 默认 300 秒一轮时约 6 小时
+    relist_price: int = 100  # 1.00 元：管理员复牌时的默认起售价
     fee_rate: float = 0.001
     order_ttl_hours: int = 24
     max_catchup: int = 500
@@ -78,6 +83,10 @@ class Config:
             round_seconds=max(30, num("round_seconds", 300, int)),
             max_change_pct=min(50.0, max(1.0, num("max_change_pct", 10.0, float))),
             min_price=min(10_000, max(1, int(round(num("min_price", 0.10, float) * 100)))),
+            delist_enabled=bool(cfg.get("delist_enabled", True)),
+            delist_price=min(10_000, max(1, int(round(num("delist_price", 0.50, float) * 100)))),
+            delist_rounds=max(1, num("delist_rounds", 72, int)),
+            relist_price=min(10_000, max(1, int(round(num("relist_price", 1.00, float) * 100)))),
             fee_rate=min(0.1, max(0.0, num("fee_rate", 0.001, float))),
             order_ttl_hours=max(1, num("order_ttl_hours", 24, int)),
             max_catchup=max(1, num("max_catchup_rounds", 500, int)),

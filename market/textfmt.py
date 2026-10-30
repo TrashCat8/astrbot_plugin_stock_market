@@ -19,6 +19,9 @@ def quote_text(
     for row in rows:
         name = row.get("name") or ""
         label = f"{row['code']} {name}".strip()
+        if row.get("delisted"):
+            lines.append(f"{label} 已退市（停牌 {fmt_money(row['price'], comma=False)}元）")
+            continue
         lines.append(f"{label} {fmt_money(row['price'], comma=False)}元 {fmt_pct(row['pct'])}")
     lines.append(f"每 {refresh_seconds} 秒更新")
     return "\n".join(lines)
@@ -91,6 +94,24 @@ def profit_text(data: dict[str, list[dict[str, Any]]], round_no: int) -> str:
     return "\n".join(lines)
 
 
+def delist_rule_text(cfg: Config) -> str:
+    """帮助文案里的退市规则，关闭时给一句说明。"""
+    if not cfg.delist_enabled:
+        return "本群未开启退市机制。"
+    span = delist_span_text(cfg)
+    return (
+        f"连续 {cfg.delist_rounds} 轮（约 {span}）低于 {fmt_money(cfg.delist_price)} 元即退市，"
+        "强制平仓，仅管理员可复牌。"
+    )
+
+
+def delist_span_text(cfg: Config) -> str:
+    hours = cfg.delist_rounds * cfg.round_seconds / 3600
+    if hours >= 1:
+        return f"{hours:.1f} 小时".replace(".0 ", " ")
+    return f"{cfg.delist_rounds * cfg.round_seconds // 60} 分钟"
+
+
 def help_text(cfg: Config) -> str:
     return (
         "【群内模拟股市】全部为虚拟货币，本群独立账户\n"
@@ -106,6 +127,7 @@ def help_text(cfg: Config) -> str:
         "/股市 transfer @对方 1000\n\n"
         f"开户 {fmt_money(cfg.initial_capital)} 元；每 {cfg.round_seconds} 秒更新，"
         f"每轮涨跌 ≤{cfg.max_change_pct:g}%，股价不会跌破 {fmt_money(cfg.min_price)} 元。\n"
+        f"退市：{delist_rule_text(cfg)}\n"
         f"买卖手续费各 {cfg.fee_rate * 100:.3f}%（向上取整到分），全天交易，整数股，不支持做空。\n"
         f"杠杆最高 {cfg.max_leverage:g} 倍，欠款日息 {cfg.margin_daily_rate * 100:.3f}%，"
         f"权益/市值低于 {cfg.margin_call_ratio * 100:.0f}% 自动强平；"

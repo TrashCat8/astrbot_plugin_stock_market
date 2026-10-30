@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from market import engine, render  # noqa: E402
+from market import engine, render, textfmt  # noqa: E402
 from market.config import Config  # noqa: E402
 
 
@@ -53,6 +53,7 @@ def main() -> int:
             "round": str(cfg.round_seconds),
             "max_pct": f"{cfg.max_change_pct:g}",
             "floor": engine.fmt_money(cfg.min_price),
+            "delist_rule": textfmt.delist_rule_text(cfg),
             "fee": f"{cfg.fee_rate * 100:.3f}",
             "ttl": str(cfg.order_ttl_hours),
             "daily": engine.fmt_money(cfg.daily_bonus),

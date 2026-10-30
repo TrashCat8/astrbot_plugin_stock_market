@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import math
 import sys
 import time
+from dataclasses import replace
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -712,6 +714,160 @@ def test_clear_cash_keeps_positions() -> None:
     assert acc["positions"]["ST001"]["shares"] == 50
     assert acc["positions"]["ST001"]["frozen"] == 0
     assert not state["orders"]
+
+
+def test_delist_config_mapping() -> None:
+    """退市参数有默认值，脏数据回落；金额从元换算成「分」。"""
+    cfg = Config.from_plugin_config({})
+    assert cfg.delist_enabled is True
+    assert cfg.delist_price == 50 and cfg.delist_rounds == 72 and cfg.relist_price == 100
+    cfg = Config.from_plugin_config(
+        {"delist_enabled": False, "delist_price": 0.8, "delist_rounds": 12, "relist_price": "2.5"}
+    )
+    assert cfg.delist_enabled is False
+    assert cfg.delist_price == 80 and cfg.delist_rounds == 12 and cfg.relist_price == 250
+    cfg = Config.from_plugin_config(
+        {"delist_price": "脏数据", "delist_rounds": None, "relist_price": "x"}
+    )
+    assert cfg.delist_price == 50 and cfg.delist_rounds == 72 and cfg.relist_price == 100
+
+
+def test_delist_triggers_and_force_closes() -> None:
+    """连续 N 轮低于退市线即退市：所有持仓按最后价强制平仓，行情停牌。"""
+    cfg = replace(CFG, delist_rounds=2, delist_price=50)
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    acc = engine.ensure_account(state, "u1", cfg)
+    engine.buy(state, "u1", "ST001", 10, cfg)
+    stock = state["stocks"]["ST001"]
+    stock["price"] = 40
+    stock["prev"] = 40
+
+    engine.advance(state, now + cfg.round_seconds, cfg)
+    assert not engine.is_delisted(stock), "只跌了 1 轮，不应退市"
+    engine.advance(state, now + cfg.round_seconds * 2, cfg)
+
+    assert engine.is_delisted(stock), "连续 2 轮低于 0.50 元应退市"
+    pos = acc["positions"]["ST001"]
+    assert pos["shares"] == 0 and pos["frozen"] == 0 and pos["cost"] == 0
+    assert acc["cash"] > cfg.initial_capital - 10 * 1000, acc["cash"]
+    assert any("退市" in item["text"] for item in state["news"])
+    rows, _, _ = engine.quote_page(state, 1, cfg)
+    row = next(r for r in rows if r["code"] == "ST001")
+    assert row["delisted"] is True
+    # 停牌后价格不再变动
+    price = int(stock["price"])
+    engine.advance(state, now + cfg.round_seconds * 20, cfg)
+    assert int(stock["price"]) == price
+
+
+def test_delist_cancels_orders_and_refunds() -> None:
+    """退市时撤掉该股全部挂单，冻结股份/资金一并退回。"""
+    cfg = replace(CFG, delist_rounds=1, delist_price=50)
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    acc = engine.ensure_account(state, "u1", cfg)
+    engine.buy(state, "u1", "ST001", 100, cfg)
+    engine.place_order(state, "u1", "sell", "ST001", 60, "20.00", cfg)
+    engine.place_order(state, "u1", "buy", "ST002", 10, "9.00", cfg)
+    assert len(state["orders"]) == 2, state["orders"]
+    frozen_before = int(acc["frozen"])
+    assert frozen_before > 0
+
+    stock = state["stocks"]["ST001"]
+    stock["price"] = 30
+    stock["prev"] = 30
+    engine.advance(state, now + cfg.round_seconds, cfg)
+
+    assert engine.is_delisted(stock)
+    # 只有该股的挂单被撤，别的股票挂单不受影响
+    left = list(state["orders"].values())
+    assert len(left) == 1 and left[0]["code"] == "ST002", left
+    pos = acc["positions"]["ST001"]
+    assert pos["shares"] == 0 and pos["frozen"] == 0
+    # 冻结股份随强平一起卖出，冻结资金（ST002 买单）继续冻结
+    assert acc["frozen"] == frozen_before
+    # 100 股按退市时的最后价全部卖出，扣手续费后到账
+    price = int(stock["price"])
+    assert price < cfg.delist_price, price
+    proceeds = price * 100 - max(1, math.ceil(price * 100 * cfg.fee_rate))
+    assert acc["cash"] == cfg.initial_capital - 100_100 - 9_009 + proceeds, acc["cash"]
+
+
+def test_delist_blocks_trading_until_relist() -> None:
+    """退市股票禁止买卖/杠杆/挂单，管理员复牌后恢复。"""
+    cfg = replace(CFG, delist_rounds=1, delist_price=50)
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    engine.ensure_account(state, "u1", cfg)
+    stock = state["stocks"]["ST001"]
+    stock["price"] = 30
+    stock["prev"] = 30
+    engine.advance(state, now + cfg.round_seconds, cfg)
+    assert engine.is_delisted(stock)
+
+    for call in (
+        lambda: engine.buy(state, "u1", "ST001", 10, cfg),
+        lambda: engine.sell(state, "u1", "ST001", 10, cfg),
+        lambda: engine.leverage_buy(state, "u1", "ST001", 10, "2", cfg),
+        lambda: engine.place_order(state, "u1", "buy", "ST001", 10, "5.00", cfg),
+    ):
+        try:
+            call()
+        except engine.MarketError as exc:
+            assert "退市" in str(exc), exc
+        else:
+            raise AssertionError("退市股票不应允许交易")
+
+    info = engine.relist(state, "ST001", "", cfg)
+    assert info["price"] == cfg.relist_price == 100
+    assert not engine.is_delisted(stock)
+    assert engine.stock_pct(stock) == 0
+    engine.buy(state, "u1", "ST001", 10, cfg)
+    assert state["accounts"]["u1"]["positions"]["ST001"]["shares"] == 10
+    assert any("复牌" in item["text"] for item in state["news"])
+
+
+def test_relist_guards() -> None:
+    """未退市的股票不能复牌；复牌价必须高于退市线；显式价格生效。"""
+    cfg = replace(CFG, delist_rounds=1, delist_price=50, relist_price=100)
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    try:
+        engine.relist(state, "ST001", "", cfg)
+    except engine.MarketError as exc:
+        assert "没有退市" in str(exc), exc
+    else:
+        raise AssertionError("没退市不该允许复牌")
+
+    stock = state["stocks"]["ST001"]
+    stock["delisted"] = True
+    for bad in ("0.50", "0.30"):
+        try:
+            engine.relist(state, "ST001", bad, cfg)
+        except engine.MarketError as exc:
+            assert "退市线" in str(exc), exc
+        else:
+            raise AssertionError(f"复牌价 {bad} 不该被接受")
+
+    info = engine.relist(state, "ST001", "3.00", cfg)
+    assert info["price"] == 300
+    assert int(stock["price"]) == 300 and int(stock["prev"]) == 300
+    assert not engine.is_delisted(stock)
+
+
+def test_delist_disabled_keeps_price() -> None:
+    """关闭退市机制后，低价股也只会贴着最低价走，不会被退市。"""
+    cfg = replace(CFG, delist_enabled=False, delist_rounds=1, delist_price=5000)
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    stock = state["stocks"]["ST001"]
+    stock["price"] = 30
+    stock["prev"] = 30
+    engine.advance(state, now + cfg.round_seconds * 5, cfg)
+    assert not engine.is_delisted(stock)
+    assert int(stock["price"]) >= cfg.min_price, stock["price"]
+    assert engine.quote_page(state, 1, cfg)[0][0]["delisted"] is False
 
 
 def main() -> int:
