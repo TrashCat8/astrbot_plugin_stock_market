@@ -15,7 +15,7 @@
     "description": "每轮最大涨跌幅（%）",
     "type": "float",
     "default": 10.0,
-    "hint": "单轮价格波动上限，包含新闻带来的影响。"
+    "hint": "单轮价格常规波动上限。被新闻点名的股票可以突破这个限制（重大 / 黑天鹅档），但不超过「新闻导致的单轮涨跌上限」。"
   },
   "min_price": {
     "description": "最低股价（元）",
@@ -81,7 +81,25 @@
     "description": "每轮生成新闻的概率",
     "type": "float",
     "default": 0.35,
-    "hint": "0 表示关闭新闻系统；新闻会影响对应股票当轮的涨跌。"
+    "hint": "0 表示关闭新闻系统。新闻按普通（55%）/ 重要（30%）/ 重大（12%）/ 黑天鹅（3%）四档加权生成，越猛越罕见，影响该股票当轮涨跌。"
+  },
+  "news_scope": {
+    "description": "新闻影响范围",
+    "type": "string",
+    "default": "sector",
+    "hint": "可选 stock / sector / market。stock：新闻只影响被点名的那只股票；sector（默认）：普通档只影响单只，重要及以上带动同板块，黑天鹅再波及全市场；market：所有新闻都带动全市场。填其他值按 sector 处理。"
+  },
+  "news_spillover": {
+    "description": "新闻外溢折扣系数（0～1）",
+    "type": "float",
+    "default": 0.4,
+    "hint": "被带动的同板块（或全市场）股票按「新闻幅度 × 本系数」涨跌；黑天鹅波及的全市场部分再乘 0.5。0.4 表示主股跌 10% 时同板块跟跌 4%。"
+  },
+  "news_max_pct": {
+    "description": "新闻导致的单轮涨跌上限（%）",
+    "type": "float",
+    "default": 30.0,
+    "hint": "重大 / 黑天鹅档可以突破「每轮最大涨跌幅」，但仍受这个上限约束（默认 30%）。低于「每轮最大涨跌幅」时按后者处理。"
   },
   "max_catchup_rounds": {
     "description": "单次最多补算轮数",

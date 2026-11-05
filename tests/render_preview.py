@@ -53,6 +53,7 @@ def main() -> int:
             "round": str(cfg.round_seconds),
             "max_pct": f"{cfg.max_change_pct:g}",
             "floor": engine.fmt_money(cfg.min_price),
+            "news_rule": textfmt.news_rule_text(cfg),
             "delist_rule": textfmt.delist_rule_text(cfg),
             "fee": f"{cfg.fee_rate * 100:.3f}",
             "ttl": str(cfg.order_ttl_hours),

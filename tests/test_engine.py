@@ -11,6 +11,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from market import engine  # noqa: E402
+from market import news as news_mod  # noqa: E402
+from market import seeds  # noqa: E402
 from market.config import Config  # noqa: E402
 
 CFG = Config(
@@ -953,6 +955,117 @@ def test_delist_disabled_keeps_price() -> None:
     assert not engine.is_delisted(stock)
     assert int(stock["price"]) >= cfg.min_price, stock["price"]
     assert engine.quote_page(state, 1, cfg)[0][0]["delisted"] is False
+
+
+def test_news_tiers_weighted_and_ranged() -> None:
+    """四档新闻的权重递减、幅度落在各自区间内；stock 范围下只影响被点名的股票。"""
+    cfg = Config(news_probability=1.0, news_scope="stock")
+    state = engine.new_state("tiers", 0.0, cfg)
+    counts = {tier["key"]: 0 for tier in news_mod.TIERS}
+    for round_no in range(1, 2001):
+        item = news_mod.maybe_generate(state, round_no, cfg)
+        assert item is not None
+        tier = news_mod.TIER_BY_KEY[item["tier"]]
+        counts[tier["key"]] += 1
+        assert tier["low"] - 1e-9 <= abs(item["pct"]) <= tier["high"] + 1e-9, item
+        assert item["impacts"] == [[item["code"], item["pct"]]], item["impacts"]
+        assert f"·{tier['label']}】" in item["text"], item["text"]
+    assert counts["normal"] > counts["major"] > counts["heavy"] > counts["blackswan"], counts
+    assert counts["blackswan"] > 0, counts
+
+
+def test_news_sector_spillover() -> None:
+    """默认 sector 范围：普通档只动单只，重要/重大带动同板块，黑天鹅波及全市场。"""
+    cfg = Config(news_probability=1.0, news_scope="sector", news_spillover=0.4)
+    state = engine.new_state("sector", 0.0, cfg)
+    seen: dict[str, dict] = {}
+    for round_no in range(1, 800):
+        item = news_mod.maybe_generate(state, round_no, cfg)
+        seen.setdefault(item["tier"], item)
+    assert set(seen) == {"normal", "major", "heavy", "blackswan"}, set(seen)
+
+    assert len(seen["normal"]["impacts"]) == 1, seen["normal"]["impacts"]
+
+    for key in ("major", "heavy"):
+        item = seen[key]
+        code = item["code"]
+        sector = seeds.sector_of(code)
+        expected = {code} | {
+            c
+            for c, s in state["stocks"].items()
+            if c != code and seeds.sector_of(c) == sector
+        }
+        got = {c for c, _ in item["impacts"]}
+        assert got == expected, (key, got, expected)
+        pct_by_code = dict(item["impacts"])
+        other = next(c for c in got if c != code)
+        assert abs(pct_by_code[other] - round(item["pct"] * 0.4, 2)) < 0.011
+
+    swan = seen["blackswan"]
+    assert {c for c, _ in swan["impacts"]} == set(state["stocks"]), swan["impacts"]
+
+
+def test_news_scope_overrides() -> None:
+    """news_scope 可切到 stock（只影响单只）或 market（全部带动全市场）。"""
+    market = Config(news_probability=1.0, news_scope="market", news_spillover=0.5)
+    state = engine.new_state("market", 0.0, market)
+    for round_no in range(1, 200):
+        item = news_mod.maybe_generate(state, round_no, market)
+        assert {c for c, _ in item["impacts"]} == set(state["stocks"]), item["impacts"]
+
+    stock_cfg = Config(news_probability=1.0, news_scope="stock")
+    state = engine.new_state("stock", 0.0, stock_cfg)
+    for round_no in range(1, 200):
+        item = news_mod.maybe_generate(state, round_no, stock_cfg)
+        assert len(item["impacts"]) == 1, item["impacts"]
+
+
+def test_news_scope_config() -> None:
+    """配置映射：非法范围回落 sector，外溢系数夹在 0～1，新闻上限不低于常规上限。"""
+    cfg = Config.from_plugin_config({})
+    assert cfg.news_scope == "sector"
+    assert cfg.news_max_pct >= cfg.max_change_pct
+    assert Config.from_plugin_config({"news_scope": "MARKET"}).news_scope == "market"
+    assert Config.from_plugin_config({"news_scope": "nonsense"}).news_scope == "sector"
+    assert Config.from_plugin_config({"news_scope": None}).news_scope == "sector"
+    assert Config.from_plugin_config({"news_spillover": 5}).news_spillover == 1.0
+    assert Config.from_plugin_config({"news_spillover": -1}).news_spillover == 0.0
+    assert Config.from_plugin_config({"news_max_pct": 5, "max_change_pct": 10}).news_max_pct == 10.0
+    assert Config.from_plugin_config({"news_max_pct": 40}).news_max_pct == 40.0
+    assert Config.from_plugin_config({"news_max_pct": 999}).news_max_pct == 100.0
+
+
+def test_news_can_exceed_round_cap() -> None:
+    """重大/黑天鹅新闻可以突破单轮常规涨跌上限，但受 news_max_pct 约束。"""
+    original = news_mod.maybe_generate
+
+    def fake(state, round_no, cfg):
+        return {
+            "round": round_no,
+            "ts": 0,
+            "code": "ST001",
+            "pct": -20.0,
+            "tier": "blackswan",
+            "tier_label": "黑天鹅",
+            "impacts": [["ST001", -20.0]],
+            "text": "【利空·黑天鹅】测试",
+        }
+
+    def run(cfg: Config) -> float:
+        state = engine.new_state("cap", 0.0, cfg)
+        engine._apply_round(state, 1, cfg)
+        stock = state["stocks"]["ST001"]
+        return (int(stock["price"]) - int(stock["prev"])) / int(stock["prev"]) * 100
+
+    news_mod.maybe_generate = fake
+    try:
+        change = run(Config(news_probability=1.0, max_change_pct=10.0, news_max_pct=25.0))
+        assert change < -10.0, change
+        assert change >= -20.5, change
+        capped = run(Config(news_probability=1.0, max_change_pct=10.0, news_max_pct=12.0))
+        assert -12.5 <= capped <= -1.0, capped
+    finally:
+        news_mod.maybe_generate = original
 
 
 def main() -> int:

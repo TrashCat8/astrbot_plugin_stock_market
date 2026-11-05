@@ -27,6 +27,10 @@ class Config:
     order_ttl_hours: int = 24
     max_catchup: int = 500
     news_probability: float = 0.35
+    # 新闻分档（普通/重要/重大/黑天鹅）：影响范围与幅度上限
+    news_scope: str = "sector"  # stock 单只 / sector 同板块（默认）/ market 全市场
+    news_spillover: float = 0.4  # 同板块/全市场的涨幅折扣
+    news_max_pct: float = 30.0  # 重大档可突破 max_change_pct，但不超过这个上限
     page_size: int = 10
     render_cards: bool = True
     allowed_groups: list[str] = field(default_factory=list)
@@ -82,10 +86,17 @@ class Config:
         if not isinstance(rename_admins, (list, tuple)):
             rename_admins = []
 
+        max_pct = min(50.0, max(1.0, num("max_change_pct", 10.0, float)))
+        news_scope = str(cfg.get("news_scope") or "sector").strip().lower()
+        if news_scope not in ("stock", "sector", "market"):
+            news_scope = "sector"
+        # 重大/黑天鹅新闻可以突破常规单轮涨跌上限，但仍有总上限兜底
+        news_max_pct = min(100.0, max(max_pct, num("news_max_pct", 30.0, float)))
+
         return cls(
             initial_capital=max(0, int(round(num("initial_capital", 100000.0, float) * 100))),
             round_seconds=max(30, num("round_seconds", 300, int)),
-            max_change_pct=min(50.0, max(1.0, num("max_change_pct", 10.0, float))),
+            max_change_pct=max_pct,
             min_price=min(10_000, max(1, int(round(num("min_price", 0.10, float) * 100)))),
             delist_enabled=bool(cfg.get("delist_enabled", True)),
             delist_price=min(10_000, max(1, int(round(num("delist_price", 0.50, float) * 100)))),
@@ -98,6 +109,9 @@ class Config:
             order_ttl_hours=max(1, num("order_ttl_hours", 24, int)),
             max_catchup=max(1, num("max_catchup_rounds", 500, int)),
             news_probability=min(1.0, max(0.0, num("news_probability", 0.35, float))),
+            news_scope=news_scope,
+            news_spillover=min(1.0, max(0.0, num("news_spillover", 0.4, float))),
+            news_max_pct=news_max_pct,
             page_size=max(1, min(50, num("page_size", 10, int))),
             render_cards=bool(cfg.get("render_cards", True)),
             allowed_groups=[str(g) for g in groups],

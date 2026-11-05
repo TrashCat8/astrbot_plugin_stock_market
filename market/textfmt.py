@@ -113,6 +113,22 @@ def delist_rule_text(cfg: Config) -> str:
     )
 
 
+def news_rule_text(cfg: Config) -> str:
+    """帮助文案里的新闻规则。"""
+    if cfg.news_probability <= 0:
+        return "本群未开启新闻系统。"
+    scope = {
+        "stock": "新闻只影响被点名的股票",
+        "sector": "重要及以上带动同板块，黑天鹅波及全市场",
+        "market": "所有新闻都会带动全市场",
+    }.get(cfg.news_scope, "重要及以上带动同板块，黑天鹅波及全市场")
+    # 拆成两行，避免帮助卡单行超宽被裁掉
+    return (
+        f"新闻分普通/重要/重大/黑天鹅四档，越高越罕见、幅度越大（最高 {cfg.news_max_pct:g}%）；\n"
+        f"{scope}；重大/黑天鹅可突破单轮涨跌上限。"
+    )
+
+
 def round_span_text(rounds: int, round_seconds: int) -> str:
     """把轮数换算成「6 小时 / 30 分钟」这样的口语时长。"""
     seconds = int(rounds) * int(round_seconds)
@@ -141,6 +157,7 @@ def help_text(cfg: Config) -> str:
         "/股市 transfer @对方 1000\n\n"
         f"开户 {fmt_money(cfg.initial_capital)} 元；每 {cfg.round_seconds} 秒更新，"
         f"每轮涨跌 ≤{cfg.max_change_pct:g}%，股价不会跌破 {fmt_money(cfg.min_price)} 元。\n"
+        f"新闻：{news_rule_text(cfg)}\n"
         f"退市：{delist_rule_text(cfg)}\n"
         f"买卖手续费各 {cfg.fee_rate * 100:.3f}%（向上取整到分），全天交易，整数股，不支持做空。\n"
         f"杠杆最高 {cfg.max_leverage:g} 倍，欠款日息 {cfg.margin_daily_rate * 100:.3f}%，"

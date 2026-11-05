@@ -114,11 +114,14 @@ def advance(state: dict[str, Any], now: float, cfg: Config) -> int:
 
 def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
     item = news_mod.maybe_generate(state, round_no, cfg)
-    impacts = {}
+    impacts: dict[str, float] = {}
     if item:
-        stock = state["stocks"].get(item["code"])
-        if stock and stock["price"] > 0:
-            impacts[item["code"]] = math.log1p(item["pct"] / 100.0)
+        # 重大/黑天鹅新闻会同时冲击同板块甚至全市场，impacts 里可能有多个代码
+        entries = item.get("impacts") or [[item["code"], item["pct"]]]
+        for code, pct in entries:
+            stock = state["stocks"].get(code)
+            if stock and stock["price"] > 0 and not is_delisted(stock):
+                impacts[code] = float(pct)
 
     limit = cfg.max_change_pct / 100.0
     # 对数空间取对称区间 [-log(1+limit), +log(1+limit)]，几何均值不变（长期无漂移），
@@ -133,14 +136,27 @@ def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
             continue
         rng = random.Random(f"{state['group']}:{code}:{round_no}")
         base = rng.uniform(log_down, log_up)
-        delta = base + impacts.get(code, 0.0)
-        delta = max(log_down, min(log_up, delta))
+        pct = impacts.get(code)
+        if pct is None:
+            delta = max(log_down, min(log_up, base))
+            stock_up, stock_down = up, down
+        else:
+            # 被新闻影响的股票：上限取「常规上限」和「新闻幅度」的较大者，
+            # 所以重大/黑天鹅档可以突破 max_change_pct，但不会无限放大；
+            # 上下仍按对数对称，避免放大波动带来长期漂移。
+            cap_pct = min(cfg.news_max_pct, max(cfg.max_change_pct, abs(pct)))
+            cap = cap_pct / 100.0
+            cap_log = math.log1p(cap)
+            stock_up = 1.0 + cap
+            stock_down = 1.0 / stock_up
+            delta = base + math.log1p(pct / 100.0)
+            delta = max(-cap_log, min(cap_log, delta))
 
         # 乘数用 exp(δ)（对数正态）而不是 1+δ：后者算术均值虽为 1，几何均值却小于 1，
         # 长期会系统性阴跌（波动拖累），让股票集体沉到低价区。
         prev = int(stock["price"])
-        low = max(cfg.min_price, int(math.ceil(prev * down)))
-        high = max(low, int(math.floor(prev * up)))
+        low = max(cfg.min_price, int(math.ceil(prev * stock_down)))
+        high = max(low, int(math.floor(prev * stock_up)))
         price = int(round(prev * math.exp(delta)))
         price = max(low, min(high, price))
 

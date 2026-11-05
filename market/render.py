@@ -544,6 +544,7 @@ _HELP_LINES: list[tuple[str, str]] = [
     ("/股市 transfer @对方 1000", "cmd"),
     ("", "gap"),
     ("开户 {capital} 元；每 {round} 秒更新，每轮涨跌 ≤{max_pct}%，股价不会跌破 {floor} 元。", "text"),
+    ("新闻：{news_rule}", "text"),
     ("退市：{delist_rule}", "text"),
     ("买卖手续费各 {fee}%（向上取整到分），全天交易，整数股，不支持做空借贷。", "text"),
     ("限价单冻结资金/股份，{ttl} 小时失效；达到限价即按当时更优报价全额成交，可撤销未成交单。", "text"),
