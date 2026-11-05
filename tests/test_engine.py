@@ -721,15 +721,37 @@ def test_delist_config_mapping() -> None:
     cfg = Config.from_plugin_config({})
     assert cfg.delist_enabled is True
     assert cfg.delist_price == 50 and cfg.delist_rounds == 72 and cfg.relist_price == 100
+    assert cfg.auto_relist is True
+    assert cfg.relist_after_rounds == 240 and cfg.relist_multiplier == 5.0
     cfg = Config.from_plugin_config(
-        {"delist_enabled": False, "delist_price": 0.8, "delist_rounds": 12, "relist_price": "2.5"}
+        {
+            "delist_enabled": False,
+            "delist_price": 0.8,
+            "delist_rounds": 12,
+            "relist_price": "2.5",
+            "auto_relist": False,
+            "relist_after_rounds": 30,
+            "relist_multiplier": 3,
+        }
     )
     assert cfg.delist_enabled is False
     assert cfg.delist_price == 80 and cfg.delist_rounds == 12 and cfg.relist_price == 250
+    assert cfg.auto_relist is False
+    assert cfg.relist_after_rounds == 30 and cfg.relist_multiplier == 3.0
     cfg = Config.from_plugin_config(
-        {"delist_price": "脏数据", "delist_rounds": None, "relist_price": "x"}
+        {
+            "delist_price": "脏数据",
+            "delist_rounds": None,
+            "relist_price": "x",
+            "relist_after_rounds": "x",
+            "relist_multiplier": "x",
+        }
     )
     assert cfg.delist_price == 50 and cfg.delist_rounds == 72 and cfg.relist_price == 100
+    assert cfg.relist_after_rounds == 240 and cfg.relist_multiplier == 5.0
+    # 倍数下限 1、上限 100
+    assert Config.from_plugin_config({"relist_multiplier": 0.2}).relist_multiplier == 1.0
+    assert Config.from_plugin_config({"relist_multiplier": 999}).relist_multiplier == 100.0
 
 
 def test_delist_triggers_and_force_closes() -> None:
@@ -819,8 +841,10 @@ def test_delist_blocks_trading_until_relist() -> None:
         else:
             raise AssertionError("退市股票不应允许交易")
 
+    expected = engine.auto_relist_price(stock, cfg)
+    assert expected > cfg.delist_price
     info = engine.relist(state, "ST001", "", cfg)
-    assert info["price"] == cfg.relist_price == 100
+    assert info["price"] == expected, info["price"]
     assert not engine.is_delisted(stock)
     assert engine.stock_pct(stock) == 0
     engine.buy(state, "u1", "ST001", 10, cfg)
@@ -854,6 +878,67 @@ def test_relist_guards() -> None:
     assert info["price"] == 300
     assert int(stock["price"]) == 300 and int(stock["prev"]) == 300
     assert not engine.is_delisted(stock)
+
+
+def test_auto_relist_after_cooldown() -> None:
+    """停牌满 relist_after_rounds 轮后按「退市价 × 倍数」自动重新上市。"""
+    cfg = replace(
+        CFG, delist_rounds=1, delist_price=50, relist_after_rounds=3, relist_multiplier=5
+    )
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    stock = state["stocks"]["ST001"]
+    stock["price"] = 30
+    stock["prev"] = 30
+    engine.advance(state, now + cfg.round_seconds, cfg)
+    assert engine.is_delisted(stock)
+    frozen_price = int(stock["price"])
+    assert frozen_price < cfg.delist_price
+
+    # 停牌第 1、2 轮还在冷却，第 3 轮结束就该复牌
+    engine.advance(state, now + cfg.round_seconds * 3, cfg)
+    assert engine.rounds_until_relist(stock, int(state["round"]), cfg) == 1
+    assert engine.is_delisted(stock)
+    engine.advance(state, now + cfg.round_seconds * 4, cfg)
+
+    assert not engine.is_delisted(stock), "冷却结束后应自动复牌"
+    expected = max(math.ceil(frozen_price * 5), cfg.relist_price, cfg.delist_price + 1)
+    assert int(stock["price"]) == expected, (stock["price"], expected)
+    assert int(stock["prev"]) == expected
+    assert any("自动重新上市" in item["text"] for item in state["news"])
+    assert engine.quote_page(state, 1, cfg)[0][0]["delisted"] is False
+    # 复牌后可以正常买卖
+    engine.ensure_account(state, "u1", cfg)
+    engine.buy(state, "u1", "ST001", 10, cfg)
+
+
+def test_auto_relist_price_floor() -> None:
+    """倍数算出来太低时用复牌底价兜底，且必须高于退市线。"""
+    cfg = replace(CFG, delist_price=50, relist_price=100, relist_multiplier=1.0)
+    stock = {"code": "ST001", "name": "", "price": 10, "prev": 10}
+    assert engine.auto_relist_price(stock, cfg) == 100
+    cfg2 = replace(cfg, relist_price=1, delist_price=50)
+    # 底价低于退市线时，仍要保证复牌价高于退市线
+    assert engine.auto_relist_price(stock, cfg2) == 51
+    stock["price"] = 30
+    cfg3 = replace(cfg2, relist_multiplier=5)
+    assert engine.auto_relist_price(stock, cfg3) == 150
+
+
+def test_auto_relist_disabled_keeps_delisted() -> None:
+    """关闭自动复牌后股票一直停牌，只能管理员手动恢复。"""
+    cfg = replace(CFG, delist_rounds=1, delist_price=50, auto_relist=False)
+    now = 1_000_000.0
+    state = engine.new_state("group_1", now, cfg)
+    stock = state["stocks"]["ST001"]
+    stock["price"] = 30
+    stock["prev"] = 30
+    engine.advance(state, now + cfg.round_seconds * 50, cfg)
+    assert engine.is_delisted(stock)
+    assert engine.rounds_until_relist(stock, int(state["round"]), cfg) == -1
+    price = int(stock["price"])
+    engine.advance(state, now + cfg.round_seconds * 400, cfg)
+    assert engine.is_delisted(stock) and int(stock["price"]) == price
 
 
 def test_delist_disabled_keeps_price() -> None:

@@ -18,7 +18,11 @@ class Config:
     delist_enabled: bool = True
     delist_price: int = 50  # 0.50 元
     delist_rounds: int = 72  # 默认 300 秒一轮时约 6 小时
-    relist_price: int = 100  # 1.00 元：管理员复牌时的默认起售价
+    relist_price: int = 100  # 1.00 元：复牌起售价的下限
+    # 自动复牌：停牌够 relist_after_rounds 轮后按「退市价 × relist_multiplier」重新上市
+    auto_relist: bool = True
+    relist_after_rounds: int = 240  # 默认 300 秒一轮时约 20 小时
+    relist_multiplier: float = 5.0
     fee_rate: float = 0.001
     order_ttl_hours: int = 24
     max_catchup: int = 500
@@ -87,6 +91,9 @@ class Config:
             delist_price=min(10_000, max(1, int(round(num("delist_price", 0.50, float) * 100)))),
             delist_rounds=max(1, num("delist_rounds", 72, int)),
             relist_price=min(10_000, max(1, int(round(num("relist_price", 1.00, float) * 100)))),
+            auto_relist=bool(cfg.get("auto_relist", True)),
+            relist_after_rounds=max(1, num("relist_after_rounds", 240, int)),
+            relist_multiplier=min(100.0, max(1.0, num("relist_multiplier", 5.0, float))),
             fee_rate=min(0.1, max(0.0, num("fee_rate", 0.001, float))),
             order_ttl_hours=max(1, num("order_ttl_hours", 24, int)),
             max_catchup=max(1, num("max_catchup_rounds", 500, int)),

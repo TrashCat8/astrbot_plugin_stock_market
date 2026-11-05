@@ -556,7 +556,11 @@ _HELP_LINES: list[tuple[str, str]] = [
 
 
 def render_help(values: dict[str, str], *, out: Path) -> Path:
-    lines = [(text.format(**values) if text else text, kind) for text, kind in _HELP_LINES]
+    lines = []
+    for text, kind in _HELP_LINES:
+        formatted = text.format(**values) if text else text
+        # 值里带换行时拆成多行（退市规则较长，硬塞一行会超出卡片宽度）
+        lines.extend((part, kind) for part in formatted.split("\n"))
     line_h = 34
     height = 40 + len(lines) * line_h + 30
     img, draw = _canvas(height)

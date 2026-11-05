@@ -165,6 +165,17 @@ def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
             if int(stock.get("below_rounds", 0)) >= cfg.delist_rounds:
                 _delist(state, stock, round_no, cfg)
 
+    if cfg.auto_relist:
+        # 停牌够久就自动重新上市，免得股票永久消失；管理员随时可以手动提前复牌
+        for stock in state["stocks"].values():
+            if not is_delisted(stock):
+                continue
+            if rounds_until_relist(stock, round_no, cfg) > 0:
+                continue
+            _relist_stock(
+                state, stock, auto_relist_price(stock, cfg), round_no, cfg, auto=True
+            )
+
     _process_orders(state, round_no, cfg)
 
 
@@ -229,7 +240,12 @@ def _delist(
             "pct": 0.0,
             "text": (
                 f"【退市】{display_label(stock)} 连续 {cfg.delist_rounds} 轮低于 "
-                f"{fmt_money(cfg.delist_price)} 元，已退市并强制平仓，等待管理员复牌。"
+                f"{fmt_money(cfg.delist_price)} 元，已退市并强制平仓，"
+                + (
+                    f"停牌 {cfg.relist_after_rounds} 轮后自动复牌。"
+                    if cfg.auto_relist
+                    else "等待管理员复牌。"
+                )
             ),
         }
     )
@@ -239,22 +255,34 @@ def _delist(
     return {"stock": stock, "price": price, "cancelled": cancelled, "holders": holders}
 
 
-def relist(
-    state: dict[str, Any], key: str, price_text: Any, cfg: Config
-) -> dict[str, Any]:
-    """管理员复牌：解除停牌，从指定价格（默认 relist_price）重新开始交易。"""
-    stock = find_stock(state, key)
+def rounds_until_relist(stock: dict[str, Any], round_no: int, cfg: Config) -> int:
+    """还要停牌多少轮才自动复牌；未退市返回 0。"""
     if not is_delisted(stock):
-        raise MarketError(f"{display_label(stock)} 没有退市，无需复牌。")
+        return 0
+    if not cfg.auto_relist:
+        return -1  # 不会自动复牌
+    since = round_no - int(stock.get("delisted_round", round_no))
+    return max(0, cfg.relist_after_rounds - since)
 
-    text = str(price_text or "").strip()
-    price = _check_price(text) if text else max(cfg.relist_price, cfg.min_price)
-    if price <= cfg.delist_price:
-        raise MarketError(
-            f"复牌价必须高于退市线 {fmt_money(cfg.delist_price)} 元，否则下一轮就会重新退市。"
-        )
 
-    round_no = int(state["round"])
+def auto_relist_price(stock: dict[str, Any], cfg: Config) -> int:
+    """自动复牌价 = 退市价 × 倍数，但不低于 relist_price，且必须高于退市线。"""
+    base = int(stock["price"])
+    price = int(math.ceil(base * cfg.relist_multiplier))
+    price = max(price, cfg.relist_price, cfg.min_price)
+    return max(price, cfg.delist_price + 1)
+
+
+def _relist_stock(
+    state: dict[str, Any],
+    stock: dict[str, Any],
+    price: int,
+    round_no: int,
+    cfg: Config,
+    *,
+    auto: bool,
+) -> dict[str, Any]:
+    """把停牌的股票重新上市：价格归位到 price，下一轮开始正常波动。"""
     stock["delisted"] = False
     stock.pop("delisted_round", None)
     stock["relisted_round"] = round_no
@@ -267,22 +295,47 @@ def relist(
         del history[: len(history) - MAX_HISTORY]
 
     news = state.setdefault("news", [])
+    if auto:
+        text = (
+            f"【复牌】{display_label(stock)} 停牌 {cfg.relist_after_rounds} 轮后自动重新上市，"
+            f"起售价 {fmt_money(price, comma=False)} 元。"
+        )
+    else:
+        text = (
+            f"【复牌】{display_label(stock)} 恢复交易，起售价 "
+            f"{fmt_money(price, comma=False)} 元。"
+        )
     news.append(
         {
             "round": round_no,
             "ts": int(time.time()),
             "code": stock["code"],
             "pct": 0.0,
-            "text": (
-                f"【复牌】{display_label(stock)} 恢复交易，起售价 "
-                f"{fmt_money(price, comma=False)} 元。"
-            ),
+            "text": text,
         }
     )
     if len(news) > news_mod.MAX_NEWS:
         del news[: len(news) - news_mod.MAX_NEWS]
 
-    return {"stock": stock, "label": display_label(stock), "price": price}
+    return {"stock": stock, "label": display_label(stock), "price": price, "auto": auto}
+
+
+def relist(
+    state: dict[str, Any], key: str, price_text: Any, cfg: Config
+) -> dict[str, Any]:
+    """管理员手动复牌：解除停牌，从指定价格（默认复牌价）提前恢复交易。"""
+    stock = find_stock(state, key)
+    if not is_delisted(stock):
+        raise MarketError(f"{display_label(stock)} 没有退市，无需复牌。")
+
+    text = str(price_text or "").strip()
+    price = _check_price(text) if text else auto_relist_price(stock, cfg)
+    if price <= cfg.delist_price:
+        raise MarketError(
+            f"复牌价必须高于退市线 {fmt_money(cfg.delist_price)} 元，否则下一轮就会重新退市。"
+        )
+
+    return _relist_stock(state, stock, price, int(state["round"]), cfg, auto=False)
 
 
 def _process_orders(state: dict[str, Any], round_no: int, cfg: Config) -> None:
@@ -370,12 +423,17 @@ def is_delisted(stock: dict[str, Any]) -> bool:
     return bool(stock.get("delisted"))
 
 
-def require_tradable(stock: dict[str, Any]) -> None:
-    if is_delisted(stock):
-        raise MarketError(
-            f"{display_label(stock)} 已退市停牌，无法交易；等管理员用"
-            f"「/股市 复牌 {stock['code']}」恢复。"
+def require_tradable(stock: dict[str, Any], cfg: Config) -> None:
+    if not is_delisted(stock):
+        return
+    if cfg.auto_relist:
+        tail = (
+            f"停牌满 {cfg.relist_after_rounds} 轮后会自动复牌，"
+            f"管理员也可用「/股市 复牌 {stock['code']}」提前恢复。"
         )
+    else:
+        tail = f"需管理员用「/股市 复牌 {stock['code']}」恢复。"
+    raise MarketError(f"{display_label(stock)} 已退市停牌，无法交易；{tail}")
 
 
 def stock_pct(stock: dict[str, Any]) -> float:
@@ -509,7 +567,7 @@ def _record_trade(
 
 def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -> dict[str, Any]:
     stock = find_stock(state, key)
-    require_tradable(stock)
+    require_tradable(stock, cfg)
     count = _check_shares(shares)
     acc = require_account(state, user)
 
@@ -542,7 +600,7 @@ def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) ->
 
 def sell(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -> dict[str, Any]:
     stock = find_stock(state, key)
-    require_tradable(stock)
+    require_tradable(stock, cfg)
     count = _check_shares(shares)
     acc = require_account(state, user)
 
@@ -601,7 +659,7 @@ def leverage_buy(
     if not cfg.margin_enabled:
         raise MarketError("本群没有开启杠杆玩法。")
     stock = find_stock(state, key)
-    require_tradable(stock)
+    require_tradable(stock, cfg)
     count = _check_shares(shares)
     leverage = _parse_leverage(leverage_text, cfg)
     acc = require_account(state, user)
@@ -666,7 +724,7 @@ def place_order(
     cfg: Config,
 ) -> dict[str, Any]:
     stock = find_stock(state, key)
-    require_tradable(stock)
+    require_tradable(stock, cfg)
     count = _check_shares(shares)
     limit = _check_price(price_text)
     acc = require_account(state, user)

@@ -42,10 +42,28 @@
     "hint": "默认 72 轮，按 300 秒一轮算约 6 小时。中途回到退市线以上会重新计数。"
   },
   "relist_price": {
-    "description": "复牌默认价（元）",
+    "description": "复牌底价（元）",
     "type": "float",
     "default": 1.0,
-    "hint": "管理员执行「/股市 复牌 代码」时不填价格就用这个价；不能低于退市线，否则会立刻重新退市。"
+    "hint": "复牌起售价的下限。管理员手动复牌时不填价格也会用它；自动复牌按「退市价 × 复牌倍数」计算，结果低于这个值就用这个值。"
+  },
+  "auto_relist": {
+    "description": "开启自动复牌",
+    "type": "bool",
+    "default": true,
+    "hint": "关闭后股票退市就永久停牌，只能管理员手动复牌。"
+  },
+  "relist_after_rounds": {
+    "description": "自动复牌前停牌轮数",
+    "type": "int",
+    "default": 240,
+    "hint": "默认 240 轮，按 300 秒一轮算约 20 小时。停牌满这么多轮后自动重新上市。"
+  },
+  "relist_multiplier": {
+    "description": "自动复牌价格倍数",
+    "type": "float",
+    "default": 5.0,
+    "hint": "自动复牌价 = 退市价 × 本倍数，且不低于复牌底价；例如 0.30 元退市、倍数 5 → 按 1.50 元重新上市。"
   },
   "fee_rate": {
     "description": "买卖手续费率",

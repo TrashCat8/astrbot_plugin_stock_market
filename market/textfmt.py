@@ -99,17 +99,31 @@ def delist_rule_text(cfg: Config) -> str:
     if not cfg.delist_enabled:
         return "本群未开启退市机制。"
     span = delist_span_text(cfg)
-    return (
+    first = (
         f"连续 {cfg.delist_rounds} 轮（约 {span}）低于 {fmt_money(cfg.delist_price)} 元即退市，"
-        "强制平仓，仅管理员可复牌。"
+        "持仓按最后价强制平仓。"
+    )
+    if not cfg.auto_relist:
+        return first + "之后由管理员复牌。"
+    # 换行让帮助卡分成两行，避免单行超宽
+    return first + (
+        f"\n停牌 {cfg.relist_after_rounds} 轮"
+        f"（约 {round_span_text(cfg.relist_after_rounds, cfg.round_seconds)}）后自动复牌，"
+        f"复牌价 = 退市价 × {cfg.relist_multiplier:g}；管理员可提前复牌。"
     )
 
 
-def delist_span_text(cfg: Config) -> str:
-    hours = cfg.delist_rounds * cfg.round_seconds / 3600
+def round_span_text(rounds: int, round_seconds: int) -> str:
+    """把轮数换算成「6 小时 / 30 分钟」这样的口语时长。"""
+    seconds = int(rounds) * int(round_seconds)
+    hours = seconds / 3600
     if hours >= 1:
         return f"{hours:.1f} 小时".replace(".0 ", " ")
-    return f"{cfg.delist_rounds * cfg.round_seconds // 60} 分钟"
+    return f"{seconds // 60} 分钟"
+
+
+def delist_span_text(cfg: Config) -> str:
+    return round_span_text(cfg.delist_rounds, cfg.round_seconds)
 
 
 def help_text(cfg: Config) -> str:

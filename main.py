@@ -303,7 +303,9 @@ class StockMarketPlugin(Star):
 
             if arg and not arg.isdigit():
                 stock = engine.find_stock(state, arg)
-                return event.plain_result(self._detail_text(stock))
+                return event.plain_result(
+                    self._detail_text(stock, cfg, int(state["round"]))
+                )
 
             page_no = int(arg) if arg.isdigit() else 1
             rows, page, pages = engine.quote_page(state, page_no, cfg)
@@ -891,7 +893,7 @@ class StockMarketPlugin(Star):
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _detail_text(stock: dict[str, Any]) -> str:
+    def _detail_text(stock: dict[str, Any], cfg: Config, round_no: int) -> str:
         pct = engine.stock_pct(stock)
         history = [int(p) for _, p in stock.get("history", [])] or [int(stock["price"])]
         text = (
@@ -901,8 +903,12 @@ class StockMarketPlugin(Star):
             f"最低 {engine.fmt_money(min(history), comma=False)} 元"
         )
         if engine.is_delisted(stock):
-            text += (
-                "\n状态 已退市（停牌），持仓已按退市价强制平仓；"
-                f"管理员可用「/股市 复牌 {stock['code']}」恢复交易。"
-            )
+            left = engine.rounds_until_relist(stock, round_no, cfg)
+            text += "\n状态 已退市（停牌），持仓已按退市价强制平仓"
+            if left > 0:
+                text += (
+                    f"；{left} 轮后自动复牌（起售价 "
+                    f"{engine.fmt_money(engine.auto_relist_price(stock, cfg))} 元）"
+                )
+            text += f"。管理员也可用「/股市 复牌 {stock['code']}」提前恢复。"
         return text
