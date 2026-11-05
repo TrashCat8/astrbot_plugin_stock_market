@@ -163,13 +163,19 @@ class StockMarketPlugin(Star):
             components = event.get_messages()
         except Exception:
             components = []
+        try:
+            self_id = str(event.get_self_id() or "")
+        except Exception:
+            self_id = ""
         for comp in components:
             qq = getattr(comp, "qq", None)
             if qq is None:
                 continue
             qq = str(qq)
-            if qq.isdigit():
-                return qq, str(getattr(comp, "name", "") or "")
+            # 跳过 @全体成员 和 @机器人自己（否则先 @bot 再 @对方时会选错目标）
+            if not qq.isdigit() or qq == self_id:
+                continue
+            return qq, str(getattr(comp, "name", "") or "")
         return "", ""
 
     def _at_target(self, event: AstrMessageEvent, rest: list[str]) -> tuple[str, str]:
@@ -184,12 +190,17 @@ class StockMarketPlugin(Star):
         return "", ""
 
     def _target_and_amount(self, event: AstrMessageEvent, rest: list[str]) -> tuple[str, str, str]:
-        """「@某人 金额」或「QQ号 金额」两种写法都支持。"""
+        """「@某人 金额」或「QQ号 金额」两种写法都支持。
+
+        AstrBot 会把 @ 一起渲染进 message_str（形如「@昵称(QQ号)」，昵称里还可能有空格），
+        所以用 @ 判断目标时，金额一律取最后一段，避免把 @ 文本当成金额。
+        """
         target, name = self._at_from_chain(event)
         if target:
-            return target, name, (rest[0] if rest else "")
-        if len(rest) >= 2:
-            return rest[0].lstrip("@"), "", rest[1]
+            return target, name, (rest[-1] if rest else "")
+        tokens = [token for token in rest if token and not token.startswith("@")]
+        if len(tokens) >= 2:
+            return tokens[0].lstrip("@"), "", tokens[1]
         return "", "", ""
 
     @asynccontextmanager

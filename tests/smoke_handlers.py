@@ -21,20 +21,33 @@ os.environ["ASTRBOT_ROOT"] = tempfile.mkdtemp(prefix="astrbot_smoke_")
 PLUGIN_DIR = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PLUGIN_DIR.parent))
 
+from astrbot.api.message_components import At  # noqa: E402
 from astrbot_plugin_stock_market.main import StockMarketPlugin  # noqa: E402
 
 
 class FakeEvent:
-    def __init__(self, gid: str = "123456", uid: str = "10001", admin: bool = False) -> None:
+    def __init__(
+        self,
+        gid: str = "123456",
+        uid: str = "10001",
+        admin: bool = False,
+        ats: list | None = None,
+        self_id: str = "1400221724",
+    ) -> None:
         self.gid = gid
         self.uid = uid
         self.admin = admin
+        self.ats = ats or []
+        self.self_id = self_id
 
     def get_group_id(self) -> str:
         return self.gid
 
     def get_sender_id(self) -> str:
         return self.uid
+
+    def get_self_id(self) -> str:
+        return self.self_id
 
     def is_admin(self) -> bool:
         return self.admin
@@ -43,7 +56,7 @@ class FakeEvent:
         return f"用户{self.uid}"
 
     def get_messages(self) -> list:
-        return []
+        return self.ats
 
     def plain_result(self, text: str) -> dict:
         return {"type": "text", "text": text}
@@ -113,6 +126,25 @@ async def main() -> int:
     check("目标开户", await plugin._cmd_open(FakeEvent(uid="10003"), namespace, cfg, []))
     check("抢劫", await call("rob", "10003"))
     check("转账", await call("transfer", "10003", "100"))
+    # @ 转账：AstrBot 会把 @ 一起渲染进 message_str（「@昵称(QQ号)」），金额不能被它污染；
+    # 前面的 @机器人 也不能被当成转账目标
+    at_event = FakeEvent(uid="10001", ats=[At(qq="1400221724", name="机器人"), At(qq="10003", name="目标")])
+    at_res = await plugin._cmd_transfer(at_event, namespace, cfg, ["@机器人(1400221724)", "@目标(10003)", "1"])
+    check("转账(@)", at_res)
+    if "1.00 元" not in at_res.get("text", ""):
+        failures.append("转账(@金额)")
+        print("FAIL @ 转账金额解析:", at_res.get("text", ""))
+    # 昵称带空格时 @ 文本会被拆成多段，金额仍必须是最后一段
+    spaces = await plugin._cmd_transfer(
+        FakeEvent(uid="10001", ats=[At(qq="10003", name="目 标")]),
+        namespace,
+        cfg,
+        ["@目", "标(10003)", "2"],
+    )
+    check("转账(@昵称带空格)", spaces)
+    if "2.00 元" not in spaces.get("text", ""):
+        failures.append("转账(@昵称带空格)")
+        print("FAIL @ 昵称带空格时金额解析:", spaces.get("text", ""))
     check("give", await call("give", "10003", "50"))
     check("give自己", await call("give", "10001", "10"))
     check("清零", await call("clear", "10003"))

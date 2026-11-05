@@ -1196,7 +1196,7 @@ def _parse_amount(text: Any) -> int:
     try:
         amount = Decimal(value)
     except Exception:
-        raise MarketError("金额格式不正确，例如「/股市 db 1000」。")
+        raise MarketError("金额格式不正确，请输入以元为单位的数字，例如 1000、9.50。")
     if amount <= 0:
         raise MarketError("金额必须大于 0。")
     return int((amount * 100).to_integral_value(rounding=ROUND_CEILING))
