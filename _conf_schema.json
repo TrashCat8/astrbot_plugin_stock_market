@@ -87,7 +87,9 @@
     "description": "新闻影响范围",
     "type": "string",
     "default": "sector",
-    "hint": "可选 stock / sector / market。stock：新闻只影响被点名的那只股票；sector（默认）：普通档只影响单只，重要及以上带动同板块，黑天鹅再波及全市场；market：所有新闻都带动全市场。填其他值按 sector 处理。"
+    "options": ["sector", "stock", "market"],
+    "labels": ["同板块（默认）", "只影响单只", "全市场"],
+    "hint": "同板块：普通档只影响单只，重要及以上带动同板块，黑天鹅再波及全市场；只影响单只：所有新闻都只影响被点名的那只股票；全市场：所有新闻都带动全市场。若配置文件里被写入了其他值，会按「同板块」处理。"
   },
   "news_spillover": {
     "description": "新闻外溢折扣系数（0～1）",
