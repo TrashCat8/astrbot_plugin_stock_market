@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import instruments as inst_mod
+from .instruments import Instrument
+
 
 @dataclass(frozen=True)
 class Config:
@@ -56,6 +59,16 @@ class Config:
     # 两套独立白名单：改名 / give+clear，均与 AstrBot 管理员完全独立
     rename_admins: list[str] = field(default_factory=list)
     market_admins: list[str] = field(default_factory=list)
+    # 行情来源：real 真实行情（默认，走 feeds）/ simulated 本地随机游走（离线兜底）
+    data_source: str = "simulated"
+    refresh_seconds: int = 60  # 真实行情缓存 TTL：同一批报价在这个时间内复用
+    fx_enabled: bool = True
+    alert_pct: float = 3.0  # 真实行情当日涨跌超过该幅度时播报异动
+    quote_timeout: float = 6.0
+    instruments: tuple[Instrument, ...] = ()
+    # 消息交互：卡片后附按钮（keyboard）/ 正文附可点文字指令链
+    interactive_buttons: bool = True
+    text_chain: bool = True
 
     @property
     def order_ttl_rounds(self) -> int:
@@ -92,6 +105,20 @@ class Config:
             news_scope = "sector"
         # 重大/黑天鹅新闻可以突破常规单轮涨跌上限，但仍有总上限兜底
         news_max_pct = min(100.0, max(max_pct, num("news_max_pct", 30.0, float)))
+
+        # 真实行情为默认来源；配置成 simulated 时退回本地随机游走
+        data_source = str(cfg.get("data_source") or "real").strip().lower()
+        if data_source not in ("real", "simulated"):
+            data_source = "real"
+        fx_enabled = bool(cfg.get("fx_enabled", True))
+        # 只有真实行情才需要品种表；模拟模式沿用内置种子，保证离线/测试基线稳定
+        instruments = (
+            inst_mod.build_instruments(
+                cfg.get("symbols"), cfg.get("fx_pairs"), fx_enabled=fx_enabled
+            )
+            if data_source == "real"
+            else ()
+        )
 
         return cls(
             initial_capital=max(0, int(round(num("initial_capital", 100000.0, float) * 100))),
@@ -133,4 +160,12 @@ class Config:
             margin_call_ratio=min(0.9, max(0.05, num("margin_call_ratio", 0.25, float))),
             rename_admins=[str(a).strip() for a in rename_admins if str(a).strip()],
             market_admins=[str(a).strip() for a in admins if str(a).strip()],
+            data_source=data_source,
+            refresh_seconds=max(15, min(3600, num("refresh_seconds", 60, int))),
+            fx_enabled=fx_enabled,
+            alert_pct=min(20.0, max(0.0, num("alert_moves_pct", 3.0, float))),
+            quote_timeout=min(30.0, max(2.0, num("quote_timeout", 6.0, float))),
+            instruments=instruments,
+            interactive_buttons=bool(cfg.get("interactive_buttons", True)),
+            text_chain=bool(cfg.get("text_chain", True)),
         )

@@ -24,6 +24,27 @@ sys.path.insert(0, str(PLUGIN_DIR.parent))
 from astrbot.api.message_components import At  # noqa: E402
 from astrbot_plugin_stock_market.main import StockMarketPlugin  # noqa: E402
 
+try:  # 消息按钮组件只有 AstrBot >= 4.29.4 才有
+    from astrbot.api.message_components import (  # noqa: E402
+        ActionRow,
+        ButtonInteraction,
+        Image,
+        Plain,
+    )
+
+    BUTTONS_OK = True
+except Exception:  # pragma: no cover - 老版本 AstrBot
+    ActionRow = ButtonInteraction = Image = Plain = None  # type: ignore[assignment]
+    BUTTONS_OK = False
+
+
+class Result(dict):
+    """模拟 AstrBot 的 MessageEventResult：dict 载荷 + .chain 组件列表。"""
+
+    def __init__(self, payload: dict, chain: list) -> None:
+        super().__init__(payload)
+        self.chain = list(chain)
+
 
 class FakeEvent:
     def __init__(
@@ -33,12 +54,16 @@ class FakeEvent:
         admin: bool = False,
         ats: list | None = None,
         self_id: str = "1400221724",
+        platform: str = "aiocqhttp",
+        interaction=None,
     ) -> None:
         self.gid = gid
         self.uid = uid
         self.admin = admin
         self.ats = ats or []
         self.self_id = self_id
+        self.platform = platform
+        self.interaction = interaction
 
     def get_group_id(self) -> str:
         return self.gid
@@ -58,18 +83,37 @@ class FakeEvent:
     def get_messages(self) -> list:
         return self.ats
 
-    def plain_result(self, text: str) -> dict:
-        return {"type": "text", "text": text}
+    def get_platform_name(self) -> str:
+        return self.platform
 
-    def image_result(self, path: str) -> dict:
+    def get_platform_id(self) -> str:
+        return self.platform
+
+    def is_button_interaction(self) -> bool:
+        return self.interaction is not None
+
+    def get_button_interaction(self):
+        return self.interaction
+
+    def plain_result(self, text: str) -> Result:
+        return Result({"type": "text", "text": text}, [Plain(text)] if BUTTONS_OK else [])
+
+    def image_result(self, path: str) -> Result:
         file = Path(path)
-        return {"type": "image", "path": str(file), "size": file.stat().st_size}
+        payload = {"type": "image", "path": str(file), "size": file.stat().st_size}
+        chain = [Image(path=str(file))] if BUTTONS_OK else []
+        return Result(payload, chain)
+
+    def chain_result(self, chain: list) -> Result:
+        return Result({"type": "chain"}, list(chain))
 
 
 async def main() -> int:
     # 两套白名单故意给不同的人：10001 管 give/clear，10002 管改名
+    # 主流程走本地模拟行情，断言不依赖网络与真实价格；真实行情+外汇放在后面单独一段
     plugin = StockMarketPlugin(  # type: ignore[arg-type]
-        None, {"market_admins": ["10001"], "rename_admins": ["10002"]}
+        None,
+        {"market_admins": ["10001"], "rename_admins": ["10002"], "data_source": "simulated"},
     )
     cfg = plugin._cfg()
     namespace = "group_123456"
@@ -79,14 +123,17 @@ async def main() -> int:
     async def call(name: str, *rest: str):
         return await getattr(plugin, f"_cmd_{name}")(event, namespace, cfg, list(rest))
 
-    def check(name: str, result: dict, expect_type: str = "text") -> None:
-        ok = result.get("type") == expect_type
+    def check(name: str, result, expect_type: str = "text") -> dict:
+        items = list(result) if isinstance(result, (list, tuple)) else [result]
+        first = items[0]
+        ok = first.get("type") == expect_type
         if expect_type == "image":
-            ok = ok and result.get("size", 0) > 1000
-        detail = result.get("text", "").splitlines()[0] if expect_type == "text" else f"{result.get('size')} bytes"
+            ok = ok and first.get("size", 0) > 1000
+        detail = first.get("text", "").splitlines()[0] if expect_type == "text" else f"{first.get('size')} bytes"
         print(("OK   " if ok else "FAIL ") + f"{name}: {detail}")
         if not ok:
             failures.append(name)
+        return first
 
     check("开户", await call("open"))
     buy = await call("buy", "ST001", "50")
@@ -101,6 +148,57 @@ async def main() -> int:
     check("新闻", await call("news"))
     check("走势", await call("chart", "ST001"), "image")
     check("帮助", await call("help"), "image")
+
+    if BUTTONS_OK:
+        # 卡片按钮：行情卡（图片）+ 按钮行（chain），按钮 id 可路由
+        q = await call("quote")
+        items = q if isinstance(q, list) else [q]
+        rows = [
+            comp
+            for item in items
+            for comp in getattr(item, "chain", [])
+            if isinstance(comp, ActionRow)
+        ]
+        ok = bool(rows) and len(rows[0].buttons) == 5 and rows[0].buttons[0].id == "stock:quote"
+        print(("OK   " if ok else "FAIL ") + f"行情卡按钮行: {[b.id for b in rows[0].buttons] if rows else '无'}")
+        if not ok:
+            failures.append("按钮行")
+
+        handlers = {
+            name: hasattr(plugin, name)
+            for name in ("button_quote", "button_fx", "button_position", "button_help")
+        }
+        print(("OK   " if all(handlers.values()) else "FAIL ") + f"按钮回调注册: {handlers}")
+        if not all(handlers.values()):
+            failures.append("按钮回调")
+
+        # QQ 官方：纯文字回退要带可点指令链
+        text_plugin = StockMarketPlugin(  # type: ignore[arg-type]
+            None, {"data_source": "simulated", "render_cards": False}
+        )
+        tcfg = text_plugin._cfg()
+        t_ev = FakeEvent(uid="10009", platform="qq_official")
+        await text_plugin._cmd_open(t_ev, "group_text", tcfg, [])
+        tq = await text_plugin._cmd_quote(t_ev, "group_text", tcfg, [])
+        chain = getattr(tq[-1] if isinstance(tq, list) else tq, "chain", [])
+        body = "\n".join(getattr(c, "text", "") for c in chain if isinstance(c, Plain))
+        ok = any(isinstance(c, ActionRow) for c in chain) and "<qqbot-cmd-input" in body
+        print(("OK   " if ok else "FAIL ") + "文字回退附按钮+指令链")
+        if not ok:
+            failures.append("文字指令链")
+
+        # 按钮点击：只回文字，且不再挂按钮（避免点一次长一条）
+        click = FakeEvent(
+            platform="qq_official",
+            interaction=ButtonInteraction(action_id="stock:quote", interaction_id="i-1"),
+        )
+        clicked = await plugin._cmd_quote(click, namespace, cfg, [])
+        ok = isinstance(clicked, dict) and clicked.get("type") == "text"
+        print(("OK   " if ok else "FAIL ") + "按钮点击回文字")
+        if not ok:
+            failures.append("按钮点击")
+    else:
+        print("SKIP 消息交互：当前 AstrBot 无按钮组件（需 >= 4.29.4）")
     check("改名", await plugin._cmd_rename(FakeEvent(uid="10002"), namespace, cfg, ["ST001", "星辰科技"]))
     check("卖出", await call("sell", "ST001", "20"))
     check("成交", await call("trades"))
@@ -236,6 +334,32 @@ async def main() -> int:
     )
     if not shared_ok:
         failures.append("名称共享")
+
+    print(f"\n{len(failures)} failure(s)")
+
+    # 真实行情 + 外汇：需要外网；接口不可用时只打印 SKIP，不计入失败
+    try:
+        real = StockMarketPlugin(  # type: ignore[arg-type]
+            None, {"market_admins": ["10001"], "data_source": "real"}
+        )
+        rcfg = real._cfg()
+        ns_real = "group_real"
+        ev = FakeEvent(gid="888888", uid="20001")
+        await real._cmd_open(ev, ns_real, rcfg, [])
+        snap = real.feed.cached()
+        if not snap:
+            print("SKIP 真实行情：接口无返回，跳过 FX 段")
+        else:
+            print(f"OK   真实行情帧: {len(snap)} 个品种，状态 {real.feed.status}")
+            fxb = await real._cmd_buy(ev, ns_real, rcfg, ["FX_USDCNY", "1000"])
+            check("外汇买入", fxb)
+            if "FX_USDCNY" not in fxb.get("text", ""):
+                failures.append("外汇买入")
+            check("汇市", await real._cmd_fx(ev, ns_real, rcfg, []), "image")
+            check("外汇走势", await real._cmd_chart(ev, ns_real, rcfg, ["FX_USDCNY"]), "image")
+            check("外汇卖单", await real._cmd_limit_sell(ev, ns_real, rcfg, ["FX_USDCNY", "100", "6.9000"]))
+    except Exception as exc:  # noqa: BLE001
+        print(f"SKIP 真实行情段（{type(exc).__name__}: {exc}）")
 
     print(f"\n{len(failures)} failure(s)")
     return 1 if failures else 0

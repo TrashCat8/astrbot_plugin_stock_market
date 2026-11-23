@@ -110,6 +110,18 @@ def _price(cents: int) -> str:
     return f"{Decimal(int(cents)) / 100:.2f}"
 
 
+def _fmt_price(value: int, scale: int = 100, digits: int = 2) -> str:
+    return f"{Decimal(int(value)) / int(scale):.{int(digits)}f}"
+
+
+def _stock_scale(stock: dict[str, Any] | None) -> int:
+    return int((stock or {}).get("price_scale") or 100)
+
+
+def _stock_digits(stock: dict[str, Any] | None) -> int:
+    return int((stock or {}).get("price_digits") or 2)
+
+
 def _pct_color(pct: float) -> tuple[int, int, int]:
     if pct > 0:
         return RED
@@ -138,6 +150,8 @@ def render_quote(
     *,
     refresh_seconds: int,
     fee_rate: float,
+    title: str = "本群行情",
+    live: bool = False,
     out: Path,
 ) -> Path:
     row_h = 46
@@ -145,10 +159,15 @@ def render_quote(
     height = 24 + header_h + row_h * len(rows) + 58
     img, draw = _canvas(height)
 
-    draw.text((36, 52), f"【本群行情 {page}/{pages}】", font=_font(29, True), fill=TEXT, anchor="lm")
+    draw.text((36, 52), f"【{title} {page}/{pages}】", font=_font(29, True), fill=TEXT, anchor="lm")
+    subtitle = (
+        f"{updated_at} 更新 · 缓存 {refresh_seconds} 秒"
+        if live
+        else f"第 {round_no} 轮 · 每 {refresh_seconds} 秒更新 · {updated_at}"
+    )
     draw.text(
         (36, 90),
-        f"第 {round_no} 轮 · 每 {refresh_seconds} 秒更新 · {updated_at}",
+        subtitle,
         font=_font(16),
         fill=MUTED,
         anchor="lm",
@@ -160,9 +179,9 @@ def render_quote(
 
     head_y = top + 24
     draw.text((44, head_y), "代码", font=_font(15), fill=DIM, anchor="lm")
-    draw.text((146, head_y), "名称", font=_font(15), fill=DIM, anchor="lm")
+    draw.text((214, head_y), "名称", font=_font(15), fill=DIM, anchor="lm")
     draw.text((566, head_y), "现价", font=_font(15), fill=DIM, anchor="rm")
-    draw.text((716, head_y), "较上轮", font=_font(15), fill=DIM, anchor="rm")
+    draw.text((716, head_y), "当日涨跌" if live else "较上轮", font=_font(15), fill=DIM, anchor="rm")
 
     for index, row in enumerate(rows):
         y = top + 48 + index * row_h
@@ -170,19 +189,24 @@ def render_quote(
             draw.rounded_rectangle((32, y - row_h // 2, WIDTH - 32, y + row_h // 2), radius=10, fill=PANEL_ALT)
         draw.text((44, y), row["code"], font=_font(19, True), fill=TEXT, anchor="lm")
         name = row.get("name") or "—"
-        draw.text((146, y), name, font=_font(19), fill=TEXT, anchor="lm")
+        draw.text((214, y), name, font=_font(19), fill=TEXT, anchor="lm")
+        price_text = row.get("price_text") or _fmt_price(
+            int(row["price"]), int(row.get("price_scale") or 100), int(row.get("digits") or 2)
+        )
         if row.get("delisted"):
             # 停牌股票价格凝固，用灰字标注，不显示涨跌
-            draw.text((566, y), _price(row["price"]), font=_font(21, True), fill=DIM, anchor="rm")
-            draw.text((716, y), "已退市", font=_font(18, True), fill=MUTED, anchor="rm")
+            draw.text((566, y), price_text, font=_font(21, True), fill=DIM, anchor="rm")
+            draw.text((716, y), "已停牌", font=_font(18, True), fill=MUTED, anchor="rm")
             continue
-        draw.text((566, y), _price(row["price"]), font=_font(21, True), fill=TEXT, anchor="rm")
+        draw.text((566, y), price_text, font=_font(21, True), fill=TEXT, anchor="rm")
         pct = float(row.get("pct", 0.0))
         draw.text((716, y), f"{pct:+.2f}%", font=_font(19, True), fill=_pct_color(pct), anchor="rm")
 
+    footer = f"红涨绿跌 · 手续费 {fee_rate * 100:.3f}%"
+    footer += " · 行情来自腾讯/新浪实时报价" if live else " · 本地模拟行情"
     draw.text(
         (36, height - 34),
-        f"红涨绿跌 · 手续费 {fee_rate * 100:.3f}% · 最低 0.01 元",
+        footer,
         font=_font(15),
         fill=DIM,
         anchor="lm",
@@ -206,7 +230,7 @@ def render_position(
     items = [
         ("可用资金", f"{_money(summary['cash'])} 元", TEXT),
         ("冻结资金", f"{_money(summary['frozen'])} 元", TEXT),
-        ("股票市值", f"{_money(summary['market_value'])} 元", TEXT),
+        ("持仓市值", f"{_money(summary['market_value'])} 元", TEXT),
         ("总资产", f"{_money(summary['total'])} 元", TEXT),
         ("杠杆欠款", f"{_money(summary['debt'])} 元", _pct_color(-summary["debt"])),
         ("净资产", f"{_money(summary['net'])} 元", TEXT),
@@ -265,7 +289,7 @@ def render_position(
         draw.text((42, y + 18), left, font=_font(19, True), fill=TEXT, anchor="lm")
         draw.text(
             (WIDTH - 42, y + 18),
-            f"{pos['shares']} 股（冻结 {pos['frozen']}）",
+            f"{pos['shares']} {pos.get('unit') or '股'}（冻结 {pos['frozen']}）",
             font=_font(17),
             fill=MUTED,
             anchor="rm",
@@ -459,6 +483,8 @@ def render_chart(stock: dict[str, Any], *, out: Path) -> Path:
     if not history:
         history = [(0, int(stock["price"]))]
 
+    scale = _stock_scale(stock)
+    digits = _stock_digits(stock)
     height = 468
     img, draw = _canvas(height)
 
@@ -467,7 +493,13 @@ def render_chart(stock: dict[str, Any], *, out: Path) -> Path:
     prev = history[0][1]
     pct = 0.0 if prev <= 0 else (history[-1][1] - prev) / prev * 100
     draw.text((36, 92), name, font=_font(17), fill=MUTED, anchor="lm")
-    draw.text((WIDTH - 36, 92), f"最新 {_price(history[-1][1])} 元", font=_font(20, True), fill=TEXT, anchor="rm")
+    draw.text(
+        (WIDTH - 36, 92),
+        f"最新 {_fmt_price(history[-1][1], scale, digits)} 元",
+        font=_font(20, True),
+        fill=TEXT,
+        anchor="rm",
+    )
     draw.text((WIDTH - 36, 120), f"区间 {pct:+.2f}%", font=_font(17, True), fill=_pct_color(pct), anchor="rm")
 
     left, right, top, bottom = 48, WIDTH - 84, 158, 396
@@ -491,7 +523,13 @@ def render_chart(stock: dict[str, Any], *, out: Path) -> Path:
         y = top + (bottom - top) * step / 4
         draw.line((left, y, right, y), fill=LINE, width=1)
         price = y_high - (y_high - y_low) * step / 4
-        draw.text((right + 12, y), f"{Decimal(int(price)) / 100:.2f}", font=_font(14), fill=DIM, anchor="lm")
+        draw.text(
+            (right + 12, y),
+            _fmt_price(int(price), scale, digits),
+            font=_font(14),
+            fill=DIM,
+            anchor="lm",
+        )
 
     points = [(map_x(i), map_y(p)) for i, (_, p) in enumerate(history)]
     if len(points) == 1:
@@ -512,7 +550,9 @@ def render_chart(stock: dict[str, Any], *, out: Path) -> Path:
     draw.text((right, bottom + 22), f"第 {history[-1][0]} 轮", font=_font(14), fill=DIM, anchor="rm")
     draw.text(
         (left, height - 18),
-        f"共 {len(history)} 个数据点 · 每轮涨跌上限由插件配置决定",
+        f"共 {len(history)} 个数据点 · 每轮涨跌上限由插件配置决定"
+        if not stock.get("quote_ts")
+        else f"共 {len(history)} 个数据点 · 真实行情采样",
         font=_font(14),
         fill=DIM,
         anchor="lm",
@@ -525,29 +565,32 @@ def render_chart(stock: dict[str, Any], *, out: Path) -> Path:
 # --------------------------------------------------------------------------- #
 
 _HELP_LINES: list[tuple[str, str]] = [
-    ("【群内模拟股市】", "title"),
-    ("全部为虚拟货币，本群独立账户。", "muted"),
+    ("【群内股市】", "title"),
+    ("全部为虚拟资金，本群独立账户。", "muted"),
     ("", "gap"),
     ("/股市 开户", "cmd"),
-    ("/股市 行情 [页码]     /股市 行情 ST001", "cmd"),
-    ("/股市 买入 ST001 100", "cmd"),
-    ("/股市 卖出 ST001 100", "cmd"),
-    ("/股市 融资买入 ST001 100 2  /股市 杠杆  /股市 还债", "cmd"),
-    ("/股市 买单 ST001 100 9.50", "cmd"),
-    ("/股市 卖单 ST001 100 12.00", "cmd"),
+    ("/股市 行情 [页码]     /股市 行情 SH600519", "cmd"),
+    ("/股市 汇市 [页码]    查看外汇行情", "cmd"),
+    ("/股市 买入 SH600519 100", "cmd"),
+    ("/股市 卖出 SH600519 100", "cmd"),
+    ("/股市 买入 FX_USDCNY 1000    外汇买卖同语法", "cmd"),
+    ("/股市 融资买入 SH600519 100 2  /股市 杠杆  /股市 还债", "cmd"),
+    ("/股市 买单 SH600519 100 1430.00", "cmd"),
+    ("/股市 卖单 SH600519 100 1500.00", "cmd"),
     ("/股市 挂单  /股市 撤单 1  /股市 成交", "cmd"),
-    ("/股市 新闻  /股市 走势 ST001", "cmd"),
+    ("/股市 新闻  /股市 走势 SH600519", "cmd"),
     ("/股市 持仓 [页码]", "cmd"),
     ("/股市 签到  /股市 排行 [N]", "cmd"),
     ("/股市 盈亏 [N]  /股市 补助", "cmd"),
     ("/股市 db 1000  /股市 抢劫 @对方", "cmd"),
     ("/股市 transfer @对方 1000", "cmd"),
     ("", "gap"),
-    ("开户 {capital} 元；每 {round} 秒更新，每轮涨跌 ≤{max_pct}%，股价不会跌破 {floor} 元。", "text"),
+    ("开户 {capital} 元。", "text"),
+    ("行情：{source_rule}", "text"),
     ("新闻：{news_rule}", "text"),
     ("退市：{delist_rule}", "text"),
-    ("买卖手续费各 {fee}%（向上取整到分），全天交易，整数股，不支持做空借贷。", "text"),
-    ("限价单冻结资金/股份，{ttl} 小时失效；达到限价即按当时更优报价全额成交，可撤销未成交单。", "text"),
+    ("买卖手续费各 {fee}%（向上取整到分），全天交易，整数单位，不支持做空借贷。", "text"),
+    ("限价单冻结资金/持仓，{ttl} 小时失效；达到限价即按当时更优报价全额成交，可撤销未成交单。", "text"),
     ("签到每天一次（基础 {daily} 元，连续签到有加成）；总资产低于 {relief} 元可领补助。", "text"),
     ("db：下注 X 元，回报 0～2X 均匀随机；抢劫只抢对方可用资金，失败会被反抢。", "text"),
     ("杠杆：自有保证金 + 系统垫付，欠款按天计息；权益/市值过低自动强平，", "text"),

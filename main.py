@@ -1,4 +1,4 @@
-"""群内模拟股市插件：开户、行情、买卖、限价单、新闻、走势。
+"""群内股市插件：开户、真实行情、买卖、限价单、外汇、走势。
 
 指令统一挂在 `/股市` 下，未命中的子指令一律回落到帮助，
 不会影响其它插件的 `/` 指令。
@@ -17,16 +17,23 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .market import engine, render, textfmt
+from .market import engine, interactive, render, textfmt
 from .market.config import Config
 from .market.engine import MarketError
+from .market.feeds import QuoteFeed
 from .market.storage import GroupStore, NameStore
 
 PLUGIN_NAME = "astrbot_plugin_stock_market"
 
+# 消息按钮要求 AstrBot >= 4.29.4；老版本自动退回纯文字
+HAS_BUTTON_ACTION = hasattr(filter, "button_action")
+
 ALIASES = {
     "开户": "open",
     "行情": "quote",
+    "汇市": "fx",
+    "外汇": "fx",
+    "fx": "fx",
     "持仓": "position",
     "买入": "buy",
     "卖出": "sell",
@@ -63,16 +70,16 @@ ALIASES = {
 
 NEED_ACCOUNT = "你还没有开户，请先发送「/股市 开户」。"
 USAGE = {
-    "买入": "用法：/股市 买入 ST001 100",
-    "卖出": "用法：/股市 卖出 ST001 100",
-    "融资买入": "用法：/股市 融资买入 ST001 100 2（2 倍杠杆）",
+    "买入": "用法：/股市 买入 SH600519 100（外汇同理：/股市 买入 FX_USDCNY 1000）",
+    "卖出": "用法：/股市 卖出 SH600519 100",
+    "融资买入": "用法：/股市 融资买入 SH600519 100 2（2 倍杠杆）",
     "杠杆": "用法：/股市 杠杆（查看欠款与强平价）",
     "还债": "用法：/股市 还债 [金额]，不填金额表示全部还清",
-    "买单": "用法：/股市 买单 ST001 100 9.50",
-    "卖单": "用法：/股市 卖单 ST001 100 12.00",
+    "买单": "用法：/股市 买单 SH600519 100 1430.00",
+    "卖单": "用法：/股市 卖单 SH600519 100 1500.00",
     "撤单": "用法：/股市 撤单 1",
-    "走势": "用法：/股市 走势 ST001",
-    "改名": "用法：/股市 改名 ST001 星辰科技（需股市管理员）",
+    "走势": "用法：/股市 走势 SH600519",
+    "改名": "用法：/股市 改名 SH600519 茅台（需股市管理员）",
     "复牌": "用法：/股市 复牌 ST003 [价格]，不填价格按默认复牌价（需股市管理员）",
     "db": "用法：/股市 db 1000（下注 1000 元）",
     "抢劫": "用法：/股市 抢劫 @对方，或 /股市 抢劫 QQ号",
@@ -90,6 +97,8 @@ class StockMarketPlugin(Star):
         self.store = GroupStore(base)
         self.names = NameStore(base)
         self._calls = 0
+        cfg = Config.from_plugin_config(config)
+        self.feed = QuoteFeed(self.store.cache_file("quotes.json"), timeout=cfg.quote_timeout)
         asset_dir = Path(__file__).resolve().parent / "assets"
         try:
             asset_dir.mkdir(exist_ok=True)
@@ -207,15 +216,20 @@ class StockMarketPlugin(Star):
     async def _session(
         self, namespace: str, cfg: Config, create: bool = False
     ) -> AsyncIterator[dict[str, Any] | None]:
-        """加载账本、补算行情，退出时原子落盘。同时刻同群指令串行执行。"""
+        """加载账本、同步行情，退出时原子落盘。同时刻同群指令串行执行。"""
         async with self.store.lock(namespace):
             state = self.store.load(namespace)
             if state is None and create:
                 state = engine.new_state(namespace, time.time(), cfg)
             if state is not None:
+                quotes = None
+                if cfg.data_source == "real" and cfg.instruments:
+                    # 行情抓取失败时 feeds 会退回上一帧，交易不受影响
+                    quotes = await self.feed.snapshot(cfg.instruments, cfg.refresh_seconds)
+                engine.ensure_instruments(state, cfg)
                 # 股票名称是全局的，每次进群先套用最新的名称表
                 self.names.apply(state)
-                engine.advance(state, time.time(), cfg)
+                engine.advance(state, time.time(), cfg, quotes=quotes)
             try:
                 yield state
             finally:
@@ -245,6 +259,94 @@ class StockMarketPlugin(Star):
         except Exception:
             logger.exception("[stock] 图片渲染失败，回退文字")
             return event.plain_result(text)
+
+    # ------------------------------------------------------------------ #
+    # 消息交互：按钮（keyboard）与文字指令链
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _platform_label(event: AstrMessageEvent) -> str:
+        parts: list[str] = []
+        for name in ("get_platform_name", "get_platform_id"):
+            fn = getattr(event, name, None)
+            if callable(fn):
+                try:
+                    parts.append(str(fn() or ""))
+                except Exception:
+                    continue
+        return " ".join(parts).lower()
+
+    def _is_qq_official(self, event: AstrMessageEvent) -> bool:
+        """文字指令链只在 QQ 官方（走 Markdown）可用，其它平台会显示成乱标签。"""
+        label = self._platform_label(event)
+        return "official" in label and ("qq" in label or "q.qq" in label)
+
+    @staticmethod
+    def _is_button_event(event: AstrMessageEvent) -> bool:
+        fn = getattr(event, "is_button_interaction", None)
+        try:
+            return bool(fn()) if callable(fn) else False
+        except Exception:
+            return False
+
+    @staticmethod
+    def _plain_text_of(result) -> str | None:
+        """纯文字结果返回正文，图片/ActionRow 等复合结果返回 None。"""
+        chain = getattr(result, "chain", None)
+        if not chain:
+            return None
+        if not all(type(comp).__name__ in ("Plain", "Text") for comp in chain):
+            return None
+        fn = getattr(result, "get_plain_text", None)
+        if callable(fn):
+            try:
+                return str(fn() or "")
+            except Exception:
+                pass
+        return "\n".join(str(getattr(comp, "text", "") or "") for comp in chain)
+
+    def _interactive(
+        self,
+        event: AstrMessageEvent,
+        cfg: Config,
+        result,
+        buttons=(),
+        links=(),
+    ):
+        """给结果挂按钮/文字链。
+
+        按钮点击本身产生的新消息不再挂按钮，避免「点一次长一条」；
+        QQ 官方对交互事件的回复只接受文字，因此按钮事件下的卡片命令统一走文字分支。
+        """
+        if result is None or self._is_button_event(event):
+            return result
+        if not interactive.available():
+            return result
+
+        row = (
+            interactive.button_row(buttons, "快捷操作")
+            if cfg.interactive_buttons and buttons
+            else None
+        )
+        want_links = bool(cfg.text_chain and links and self._is_qq_official(event))
+        if row is None and not want_links:
+            return result
+
+        items = list(result) if isinstance(result, (list, tuple)) else [result]
+        head, last = items[:-1], items[-1]
+
+        plain = self._plain_text_of(last)
+        if plain is not None:
+            text = interactive.with_links(plain, links) if want_links else plain
+            chain = [interactive.Plain(text)]
+            if row is not None:
+                chain.append(row)
+            return [*head, event.chain_result(chain)]
+
+        # 图片等非文字结果：按钮单独发一条，避免平台拒绝「媒体 + keyboard」
+        if row is None:
+            return result
+        return [*items, event.chain_result([interactive.Plain("快捷操作"), row])]
 
     # ------------------------------------------------------------------ #
     # 指令入口
@@ -305,30 +407,58 @@ class StockMarketPlugin(Star):
             "发送「/股市 行情」开始交易。"
         )
 
-    async def _cmd_quote(self, event, namespace, cfg, rest):
+    async def _cmd_quote(self, event, namespace, cfg, rest, kind: str | None = "stock"):
         user = self._user(event)
+        text_only = self._is_button_event(event)
         arg = rest[0] if rest else ""
+        if arg.lower() in ("fx", "外汇", "汇市"):
+            kind = "fx"
+            arg = rest[1] if len(rest) > 1 else ""
+        elif arg.lower() in ("all", "全部"):
+            kind = None
+            arg = rest[1] if len(rest) > 1 else ""
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             engine.require_account(state, user)
 
             if arg and not arg.isdigit():
                 stock = engine.find_stock(state, arg)
-                return event.plain_result(
-                    self._detail_text(stock, cfg, int(state["round"]))
-                )
+                detail = self._detail_text(stock, cfg, int(state["round"]))
+                return self._interactive(event, cfg, event.plain_result(detail), (), ())
 
             page_no = int(arg) if arg.isdigit() else 1
-            rows, page, pages = engine.quote_page(state, page_no, cfg)
+            rows, page, pages = engine.quote_page(state, page_no, cfg, kind=kind)
+            if not rows:
+                return self._interactive(
+                    event,
+                    cfg,
+                    event.plain_result(
+                        "本群还没有配置外汇品种，请在插件配置里开启「外汇交易」。"
+                        if kind == "fx"
+                        else "本群还没有配置任何品种。"
+                    ),
+                    (),
+                    (),
+                )
             round_no = int(state["round"])
             updated = engine.fmt_time(time.time())
-            text = textfmt.quote_text(rows, page, pages, round_no, cfg.round_seconds)
+            title = "本群汇市" if kind == "fx" else "本群行情"
+            refresh = cfg.refresh_seconds if cfg.data_source == "real" else cfg.round_seconds
+            text = textfmt.quote_text(
+                rows, page, pages, round_no, refresh, title=title
+            )
             out = self.store.cache_file(
-                f"quote_{namespace}_{page}_{round_no}.png"
+                f"quote_{namespace}_{kind or 'all'}_{page}_{round_no}.png"
             )
 
-        if not self._card_ok(cfg):
-            return event.plain_result(text)
+        if text_only or not self._card_ok(cfg):
+            return self._interactive(
+                event,
+                cfg,
+                event.plain_result(text),
+                () if text_only else interactive.QUOTE_BUTTONS,
+                interactive.QUOTE_LINKS,
+            )
         try:
             render.render_quote(
                 rows,
@@ -336,17 +466,35 @@ class StockMarketPlugin(Star):
                 pages,
                 round_no,
                 updated,
-                refresh_seconds=cfg.round_seconds,
+                refresh_seconds=refresh,
                 fee_rate=cfg.fee_rate,
+                title=title,
+                live=cfg.data_source == "real",
                 out=out,
             )
         except Exception:
             logger.exception("[stock] 行情卡渲染失败，回退文字")
-            return event.plain_result(text)
-        return event.image_result(str(out))
+            return self._interactive(
+                event,
+                cfg,
+                event.plain_result(text),
+                interactive.QUOTE_BUTTONS,
+                interactive.QUOTE_LINKS,
+            )
+        return self._interactive(
+            event,
+            cfg,
+            event.image_result(str(out)),
+            interactive.QUOTE_BUTTONS,
+            interactive.QUOTE_LINKS,
+        )
+
+    async def _cmd_fx(self, event, namespace, cfg, rest):
+        return await self._cmd_quote(event, namespace, cfg, rest, kind="fx")
 
     async def _cmd_position(self, event, namespace, cfg, rest):
         user = self._user(event)
+        text_only = self._is_button_event(event)
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             self._mark_name(event, state, user)
@@ -357,14 +505,32 @@ class StockMarketPlugin(Star):
             text = textfmt.position_text(summary, round_no)
             out = self.store.cache_file(f"position_{namespace}_{round_no}.png")
 
-        if not self._card_ok(cfg):
-            return self._with_notes(event, notes, event.plain_result(text))
+        if text_only or not self._card_ok(cfg):
+            return self._interactive(
+                event,
+                cfg,
+                self._with_notes(event, notes, event.plain_result(text)),
+                () if text_only else interactive.POSITION_BUTTONS,
+                interactive.POSITION_LINKS,
+            )
         try:
             render.render_position(summary, round_no, updated, out=out)
         except Exception:
             logger.exception("[stock] 持仓卡渲染失败，回退文字")
-            return self._with_notes(event, notes, event.plain_result(text))
-        return self._with_notes(event, notes, event.image_result(str(out)))
+            return self._interactive(
+                event,
+                cfg,
+                self._with_notes(event, notes, event.plain_result(text)),
+                interactive.POSITION_BUTTONS,
+                interactive.POSITION_LINKS,
+            )
+        return self._interactive(
+            event,
+            cfg,
+            self._with_notes(event, notes, event.image_result(str(out))),
+            interactive.POSITION_BUTTONS,
+            interactive.POSITION_LINKS,
+        )
 
     async def _cmd_buy(self, event, namespace, cfg, rest):
         if len(rest) < 2:
@@ -377,8 +543,8 @@ class StockMarketPlugin(Star):
             notes = engine.pop_notices(engine.require_account(state, user))
         lines = [
             *notes,
-            f"买入成功：{trade['label']} × {trade['shares']} 股",
-            f"成交价 {engine.fmt_money(trade['price'], comma=False)} 元，"
+            f"买入成功：{trade['label']} × {trade['shares']} {trade['unit']}",
+            f"成交价 {trade['price_text']} 元/{trade['unit']}，"
             f"手续费 {engine.fmt_money(trade['fee'])} 元",
             f"可用资金: {engine.fmt_money(trade['cash'])} 元",
         ]
@@ -395,8 +561,8 @@ class StockMarketPlugin(Star):
             notes = engine.pop_notices(engine.require_account(state, user))
         lines = [
             *notes,
-            f"卖出成功：{trade['label']} × {trade['shares']} 股",
-            f"成交价 {engine.fmt_money(trade['price'], comma=False)} 元，"
+            f"卖出成功：{trade['label']} × {trade['shares']} {trade['unit']}",
+            f"成交价 {trade['price_text']} 元/{trade['unit']}，"
             f"手续费 {engine.fmt_money(trade['fee'])} 元",
             f"到账 {engine.fmt_money(trade['proceeds'])} 元，"
             f"本次盈亏 {engine.fmt_money(trade['realized'])} 元",
@@ -419,9 +585,9 @@ class StockMarketPlugin(Star):
             notes = engine.pop_notices(engine.require_account(state, user))
         lines = [
             *notes,
-            f"融资买入成功：{trade['label']} × {trade['shares']} 股"
+            f"融资买入成功：{trade['label']} × {trade['shares']} {trade['unit']}"
             f"（{trade['leverage']:g} 倍）",
-            f"成交价 {engine.fmt_money(trade['price'], comma=False)} 元，"
+            f"成交价 {trade['price_text']} 元/{trade['unit']}，"
             f"手续费 {engine.fmt_money(trade['fee'])} 元",
             f"自有保证金 {engine.fmt_money(trade['margin'])} 元，"
             f"系统垫付 {engine.fmt_money(trade['borrowed'])} 元",
@@ -450,15 +616,16 @@ class StockMarketPlugin(Star):
             f"日息 {info['daily_rate'] * 100:.3f}%",
         ]
         if not info["positions"]:
-            lines.append("没有杠杆持仓。用法：/股市 融资买入 ST001 100 2")
+            lines.append("没有杠杆持仓。用法：/股市 融资买入 SH600519 100 2")
         for row in info["positions"]:
             lines.append(
-                f"{row['label']}：{row['shares']} 股，欠款 {engine.fmt_money(row['debt'])} 元"
+                f"{row['label']}：{row['shares']} {row['unit']}，"
+                f"欠款 {engine.fmt_money(row['debt'])} 元"
             )
             lines.append(
-                f"  市值 {engine.fmt_money(row['value'])} 元 · "
+                f"  现价 {row['price_text']} · 市值 {engine.fmt_money(row['value'])} 元 · "
                 f"权益比 {row['ratio']:.1f}% · "
-                f"强平价 {engine.fmt_money(row['liq_price'], comma=False)} 元"
+                f"强平价 {row['liq_price_text']}"
             )
         lines.append(
             f"权益/市值低于 {info['call_ratio'] * 100:.0f}% 时自动强平；"
@@ -500,21 +667,22 @@ class StockMarketPlugin(Star):
             executed_at = result["executed_at"]
 
         label = "买入" if side == "buy" else "卖出"
+        unit = engine.unit_label(stock)
         if executed_at:
             return event.plain_result(
-                f"{label}单已立即成交：{engine.display_label(stock)} × {order['shares']} 股\n"
-                f"成交价 {engine.fmt_money(executed_at, comma=False)} 元"
-                f"（优于限价 {engine.fmt_money(order['limit'], comma=False)} 元）"
+                f"{label}单已立即成交：{engine.display_label(stock)} × {order['shares']} {unit}\n"
+                f"成交价 {engine.fmt_price(stock, executed_at)} 元/{unit}"
+                f"（优于限价 {engine.fmt_price(stock, int(order['limit']))} 元）"
             )
 
         frozen = (
             f"冻结 {engine.fmt_money(order['frozen'])} 元"
             if side == "buy"
-            else f"冻结 {order['shares']} 股"
+            else f"冻结 {order['shares']} {unit}"
         )
         return event.plain_result(
             f"已挂{label}单 #{order['id']}：{engine.display_label(stock)} "
-            f"{order['shares']} 股，限价 {engine.fmt_money(order['limit'], comma=False)} 元\n"
+            f"{order['shares']} {unit}，限价 {engine.fmt_price(stock, int(order['limit']))} 元\n"
             f"{frozen}，{cfg.order_ttl_hours} 小时未成交自动撤销。"
         )
 
@@ -527,17 +695,19 @@ class StockMarketPlugin(Star):
                 key=lambda o: int(o["id"]),
             )
             round_no = int(state["round"])
+            lines = ["【我的挂单】"]
+            for order in orders:
+                stock = state["stocks"].get(order["code"]) or {"code": order["code"]}
+                side_text = "买入" if order["side"] == "buy" else "卖出"
+                remain = max(0, int(order["expire_round"]) - round_no)
+                lines.append(
+                    f"#{order['id']} {side_text} {order['code']} {order['shares']} "
+                    f"{engine.unit_label(stock)} @ "
+                    f"{engine.fmt_price(stock, int(order['limit']))} 元（还剩 {remain} 轮）"
+                )
 
         if not orders:
             return event.plain_result("当前没有挂单。")
-        lines = ["【我的挂单】"]
-        for order in orders:
-            side = "买入" if order["side"] == "buy" else "卖出"
-            remain = max(0, int(order["expire_round"]) - round_no)
-            lines.append(
-                f"#{order['id']} {side} {order['code']} {order['shares']} 股 "
-                f"@ {engine.fmt_money(order['limit'], comma=False)} 元（还剩 {remain} 轮）"
-            )
         lines.append(f"共 {len(orders)} 笔 · 发「/股市 撤单 编号」可撤销")
         return event.plain_result("\n".join(lines))
 
@@ -548,9 +718,11 @@ class StockMarketPlugin(Star):
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             order = engine.cancel_order(state, user, rest[0])
+            stock = state["stocks"].get(order["code"]) or {"code": order["code"]}
+            unit = engine.unit_label(stock)
         return event.plain_result(
-            f"已撤销挂单 #{order['id']}：{order['code']} {order['shares']} 股，"
-            f"冻结的{'资金' if order['side'] == 'buy' else '股份'}已退回。"
+            f"已撤销挂单 #{order['id']}：{order['code']} {order['shares']} {unit}，"
+            f"冻结的{'资金' if order['side'] == 'buy' else '持仓'}已退回。"
         )
 
     async def _cmd_trades(self, event, namespace, cfg, rest):
@@ -558,25 +730,27 @@ class StockMarketPlugin(Star):
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             trades = [t for t in state.get("trades", []) if t["user"] == user][-10:]
+            lines = ["【我的最近成交】"]
+            kinds = {
+                "market": "市价",
+                "limit": "限价",
+                "margin": "融资",
+                "liquidate": "强平",
+                "delist": "清盘",
+            }
+            for trade in reversed(trades):
+                stock = state["stocks"].get(trade["code"]) or {"code": trade["code"]}
+                side_text = "买入" if trade["side"] == "buy" else "卖出"
+                kind_text = kinds.get(trade["kind"], "限价")
+                lines.append(
+                    f"{engine.fmt_time(trade['ts'])} {side_text}{kind_text} {trade['code']} "
+                    f"{trade['shares']} {engine.unit_label(stock)} @ "
+                    f"{engine.fmt_price(stock, int(trade['price']))} 元 "
+                    f"费 {engine.fmt_money(trade['fee'])} 元"
+                )
 
         if not trades:
             return event.plain_result("还没有成交记录。")
-        lines = ["【我的最近成交】"]
-        kinds = {
-            "market": "市价",
-            "limit": "限价",
-            "margin": "融资",
-            "liquidate": "强平",
-            "delist": "退市清盘",
-        }
-        for trade in reversed(trades):
-            side = "买入" if trade["side"] == "buy" else "卖出"
-            kind = kinds.get(trade["kind"], "限价")
-            lines.append(
-                f"{engine.fmt_time(trade['ts'])} {side}{kind} {trade['code']} "
-                f"{trade['shares']} 股 @ {engine.fmt_money(trade['price'], comma=False)} 元 "
-                f"费 {engine.fmt_money(trade['fee'])} 元"
-            )
         return event.plain_result("\n".join(lines))
 
     async def _cmd_news(self, event, namespace, cfg, rest):
@@ -595,13 +769,18 @@ class StockMarketPlugin(Star):
     async def _cmd_chart(self, event, namespace, cfg, rest):
         if not rest:
             raise MarketError(USAGE["走势"])
+        text_only = self._is_button_event(event)
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             stock = engine.find_stock(state, rest[0])
             snapshot = {
                 "code": stock["code"],
                 "name": stock.get("name") or "",
+                "kind": stock.get("kind") or "stock",
                 "price": int(stock["price"]),
+                "price_scale": engine.price_scale(stock),
+                "price_digits": engine.price_digits(stock),
+                "prev": int(stock.get("prev") or stock["price"]),
                 "history": [list(item) for item in stock.get("history", [])],
             }
             text = textfmt.chart_text(snapshot)
@@ -609,14 +788,14 @@ class StockMarketPlugin(Star):
                 f"chart_{namespace}_{snapshot['code']}_{int(state['round'])}.png"
             )
 
-        if not self._card_ok(cfg):
-            return event.plain_result(text)
+        if text_only or not self._card_ok(cfg):
+            return self._interactive(event, cfg, event.plain_result(text), (), ())
         try:
             render.render_chart(snapshot, out=out)
         except Exception:
             logger.exception("[stock] 走势卡渲染失败，回退文字")
-            return event.plain_result(text)
-        return event.image_result(str(out))
+            return self._interactive(event, cfg, event.plain_result(text), (), ())
+        return self._interactive(event, cfg, event.image_result(str(out)), (), ())
 
     async def _cmd_relist(self, event, namespace, cfg, rest):
         self._require_market_admin(event, cfg, "复牌")
@@ -627,10 +806,12 @@ class StockMarketPlugin(Star):
             state = self._require(state)
             self._mark_name(event, state, user)
             info = engine.relist(state, rest[0], rest[1] if len(rest) > 1 else "", cfg)
+            label = info["label"]
+            price_text = engine.fmt_price(info["stock"], int(info["price"]))
 
         return event.plain_result(
-            f"已复牌：{info['label']}\n"
-            f"起售价 {engine.fmt_money(info['price'], comma=False)} 元"
+            f"已复牌：{label}\n"
+            f"起售价 {price_text} 元"
             f"（退市线 {engine.fmt_money(cfg.delist_price)} 元），行情从下一轮继续。"
         )
 
@@ -641,7 +822,7 @@ class StockMarketPlugin(Star):
         code = rest[0].upper()
         name = " ".join(rest[1:]).strip()
         if not name:
-            raise MarketError("请提供名称，例如「/股市 改名 ST001 星辰科技」。")
+            raise MarketError("请提供名称，例如「/股市 改名 SH600519 茅台」。")
         if len(name) > 12:
             raise MarketError("名称最多 12 个字。")
 
@@ -649,8 +830,8 @@ class StockMarketPlugin(Star):
             if state is not None:
                 engine.find_stock(state, code)  # 校验代码是否存在
                 state["stocks"][code]["name"] = name
-            elif not engine.is_known_code(code):
-                raise MarketError(f"没有找到股票「{rest[0]}」。")
+            elif not engine.is_known_code(code, cfg):
+                raise MarketError(f"没有找到品种「{rest[0]}」。")
             # 名称写入全局表，所有群下一次指令自动同步
             await self.names.set_name(code, name)
 
@@ -702,6 +883,7 @@ class StockMarketPlugin(Star):
 
     async def _cmd_rank(self, event, namespace, cfg, rest):
         limit = cfg.rank_size
+        text_only = self._is_button_event(event)
         if rest and rest[0].isdigit():
             limit = max(1, min(50, int(rest[0])))
         async with self._session(namespace, cfg) as state:
@@ -715,17 +897,18 @@ class StockMarketPlugin(Star):
 
         if not rows:
             return event.plain_result("本群还没有人开户，发「/股市 开户」开始。")
-        if not self._card_ok(cfg):
-            return event.plain_result(text)
+        if text_only or not self._card_ok(cfg):
+            return self._interactive(event, cfg, event.plain_result(text), (), ())
         try:
             render.render_rank(rows, round_no, updated, out=out)
         except Exception:
             logger.exception("[stock] 排行卡渲染失败，回退文字")
-            return event.plain_result(text)
-        return event.image_result(str(out))
+            return self._interactive(event, cfg, event.plain_result(text), (), ())
+        return self._interactive(event, cfg, event.image_result(str(out)), (), ())
 
     async def _cmd_profit(self, event, namespace, cfg, rest):
         limit = cfg.rank_size
+        text_only = self._is_button_event(event)
         if rest and rest[0].isdigit():
             limit = max(1, min(50, int(rest[0])))
         async with self._session(namespace, cfg) as state:
@@ -739,14 +922,14 @@ class StockMarketPlugin(Star):
 
         if not data["gainers"] and not data["losers"]:
             return event.plain_result("本群还没有人产生盈亏，先做几笔买卖吧。")
-        if not self._card_ok(cfg):
-            return event.plain_result(text)
+        if text_only or not self._card_ok(cfg):
+            return self._interactive(event, cfg, event.plain_result(text), (), ())
         try:
             render.render_profit(data, round_no, updated, out=out)
         except Exception:
             logger.exception("[stock] 盈亏卡渲染失败，回退文字")
-            return event.plain_result(text)
-        return event.image_result(str(out))
+            return self._interactive(event, cfg, event.plain_result(text), (), ())
+        return self._interactive(event, cfg, event.image_result(str(out)), (), ())
 
     async def _cmd_gamble(self, event, namespace, cfg, rest):
         if not rest:
@@ -880,14 +1063,22 @@ class StockMarketPlugin(Star):
         )
 
     async def _cmd_help(self, event, namespace, cfg, rest):
-        if not self._card_ok(cfg):
-            return event.plain_result(textfmt.help_text(cfg))
+        text_only = self._is_button_event(event)
+        if text_only or not self._card_ok(cfg):
+            return self._interactive(
+                event,
+                cfg,
+                event.plain_result(textfmt.help_text(cfg)),
+                () if text_only else interactive.HELP_BUTTONS,
+                interactive.HELP_LINKS,
+            )
         out = self.store.cache_file("help.png")
         values = {
             "capital": engine.fmt_money(cfg.initial_capital),
             "round": str(cfg.round_seconds),
             "max_pct": f"{cfg.max_change_pct:g}",
             "floor": engine.fmt_money(cfg.min_price),
+            "source_rule": textfmt.source_rule_text(cfg),
             "news_rule": textfmt.news_rule_text(cfg),
             "delist_rule": textfmt.delist_rule_text(cfg),
             "fee": f"{cfg.fee_rate * 100:.3f}",
@@ -899,8 +1090,72 @@ class StockMarketPlugin(Star):
             render.render_help(values, out=out)
         except Exception:
             logger.exception("[stock] 帮助卡渲染失败，回退文字")
-            return event.plain_result(textfmt.help_text(cfg))
-        return event.image_result(str(out))
+            return self._interactive(
+                event,
+                cfg,
+                event.plain_result(textfmt.help_text(cfg)),
+                interactive.HELP_BUTTONS,
+                interactive.HELP_LINKS,
+            )
+        return self._interactive(
+            event,
+            cfg,
+            event.image_result(str(out)),
+            interactive.HELP_BUTTONS,
+            interactive.HELP_LINKS,
+        )
+
+    # ------------------------------------------------------------------ #
+    # 按钮回调：点击卡片下方的按钮，等价于发一条对应指令
+    # 需要 AstrBot >= 4.29.4（filter.button_action + 内置按钮组件）
+    # ------------------------------------------------------------------ #
+
+    if HAS_BUTTON_ACTION and interactive.available():
+
+        @filter.button_action("stock:quote")
+        async def button_quote(self, event: AstrMessageEvent):
+            async for result in self.market(event, "行情"):
+                yield result
+
+        @filter.button_action("stock:fx")
+        async def button_fx(self, event: AstrMessageEvent):
+            async for result in self.market(event, "汇市"):
+                yield result
+
+        @filter.button_action("stock:position")
+        async def button_position(self, event: AstrMessageEvent):
+            async for result in self.market(event, "持仓"):
+                yield result
+
+        @filter.button_action("stock:checkin")
+        async def button_checkin(self, event: AstrMessageEvent):
+            async for result in self.market(event, "签到"):
+                yield result
+
+        @filter.button_action("stock:rank")
+        async def button_rank(self, event: AstrMessageEvent):
+            async for result in self.market(event, "排行"):
+                yield result
+
+        @filter.button_action("stock:profit")
+        async def button_profit(self, event: AstrMessageEvent):
+            async for result in self.market(event, "盈亏"):
+                yield result
+
+        @filter.button_action("stock:relief")
+        async def button_relief(self, event: AstrMessageEvent):
+            async for result in self.market(event, "补助"):
+                yield result
+
+        @filter.button_action("stock:news")
+        async def button_news(self, event: AstrMessageEvent):
+            async for result in self.market(event, "新闻"):
+                yield result
+
+        @filter.button_action("stock:help")
+        async def button_help(self, event: AstrMessageEvent):
+            async for result in self.market(event, "帮助"):
+                yield result
 
     # ------------------------------------------------------------------ #
 
@@ -908,19 +1163,28 @@ class StockMarketPlugin(Star):
     def _detail_text(stock: dict[str, Any], cfg: Config, round_no: int) -> str:
         pct = engine.stock_pct(stock)
         history = [int(p) for _, p in stock.get("history", [])] or [int(stock["price"])]
-        text = (
-            f"{engine.display_label(stock)}\n"
-            f"现价 {engine.fmt_money(stock['price'], comma=False)} 元 {engine.fmt_pct(pct)}\n"
-            f"区间最高 {engine.fmt_money(max(history), comma=False)} 元 · "
-            f"最低 {engine.fmt_money(min(history), comma=False)} 元"
-        )
+        unit = engine.unit_label(stock)
+        prev = int(stock.get("prev") or stock["price"])
+        lines = [
+            engine.display_label(stock),
+            f"现价 {engine.fmt_price(stock, int(stock['price']))} 元/{unit} {engine.fmt_pct(pct)}",
+            f"昨收 {engine.fmt_price(stock, prev)} 元 · "
+            f"区间 {engine.fmt_price(stock, min(history))} ~ "
+            f"{engine.fmt_price(stock, max(history))} 元",
+        ]
+        if stock.get("open"):
+            lines.append(
+                f"今日开 {engine.fmt_price(stock, int(stock['open']))} · "
+                f"高 {engine.fmt_price(stock, int(stock.get('high') or stock['price']))} · "
+                f"低 {engine.fmt_price(stock, int(stock.get('low') or stock['price']))}"
+            )
         if engine.is_delisted(stock):
             left = engine.rounds_until_relist(stock, round_no, cfg)
-            text += "\n状态 已退市（停牌），持仓已按退市价强制平仓"
+            tail = "\n状态 已退市（停牌），持仓已按退市价强制平仓"
             if left > 0:
-                text += (
+                tail += (
                     f"；{left} 轮后自动复牌（起售价 "
-                    f"{engine.fmt_money(engine.auto_relist_price(stock, cfg))} 元）"
+                    f"{engine.fmt_price(stock, engine.auto_relist_price(stock, cfg))} 元）"
                 )
-            text += f"。管理员也可用「/股市 复牌 {stock['code']}」提前恢复。"
-        return text
+            lines.append(tail + f"。管理员也可用「/股市 复牌 {stock['code']}」提前恢复。")
+        return "\n".join(lines)

@@ -1,9 +1,12 @@
-"""群内模拟股市核心逻辑：行情推进、交易、限价单、账本。
+"""群内股市核心逻辑：行情同步、交易、限价单、账本。
 
 设计要点：
 - 所有金额以「分」为单位存整数，手续费向上取整到分，避免浮点误差。
-- 行情按轮次推进；轮次由时间戳推导，查询时惰性补算，因此不需要后台任务，
-  容器重启后行情依然连续，且补算结果与实时推进逐分一致（随机种子含轮次）。
+- 价格本身也是整数，但精度按品种区分：股票 100（分），外汇 1_000_000
+  （百万分之一元），统一用 `value_cents(price × 数量)` 换算成金额。
+- 真实行情模式（`data_source="real"`）下价格由外部行情快照覆盖，轮次只作为
+  挂单有效期与图表横轴的节拍；模拟模式（`simulated`）保留按轮次确定性游走，
+  作为离线兜底与单元测试基线。
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ from typing import Any
 
 from . import news as news_mod
 from .config import Config
+from .instruments import SCALE_STOCK
 from .seeds import SEED_STOCKS
 
 MAX_HISTORY = 240
@@ -28,8 +32,46 @@ class MarketError(Exception):
 
 
 # --------------------------------------------------------------------------- #
-# 格式化
+# 格式化 / 价格精度
 # --------------------------------------------------------------------------- #
+
+
+def price_scale(stock: dict[str, Any] | None) -> int:
+    """报价精度：股票 100（分），外汇 1_000_000。"""
+    if not stock:
+        return SCALE_STOCK
+    try:
+        return max(1, int(stock.get("price_scale") or SCALE_STOCK))
+    except (TypeError, ValueError):
+        return SCALE_STOCK
+
+
+def price_digits(stock: dict[str, Any] | None) -> int:
+    if not stock:
+        return 2
+    try:
+        return max(0, min(8, int(stock.get("price_digits") or 2)))
+    except (TypeError, ValueError):
+        return 2
+
+
+def fmt_price(stock: dict[str, Any] | None, price: int) -> str:
+    """按品种精度格式化报价（股票 2 位、外汇 4/6 位）。"""
+    return f"{Decimal(int(price)) / price_scale(stock):.{price_digits(stock)}f}"
+
+
+def value_cents(stock: dict[str, Any] | None, price: int, units: int) -> int:
+    """价格 × 数量 → 分。买卖共用一条公式，保证往返结算闭合。"""
+    scale = price_scale(stock)
+    return int(price) * int(units) * 100 // scale
+
+
+def unit_label(stock: dict[str, Any] | None) -> str:
+    return "单位" if (stock or {}).get("kind") == "fx" else "股"
+
+
+def currency_of(stock: dict[str, Any] | None) -> str:
+    return str((stock or {}).get("currency") or "CNY")
 
 
 def fmt_money(cents: int, comma: bool = True) -> str:
@@ -64,15 +106,38 @@ def current_round(state: dict[str, Any], now: float, cfg: Config) -> int:
 
 def new_state(group: str, now: float, cfg: Config) -> dict[str, Any]:
     stocks: dict[str, dict[str, Any]] = {}
-    for item in SEED_STOCKS:
-        price = int(item["price"])
-        stocks[item["code"]] = {
-            "code": item["code"],
-            "name": item.get("name", ""),
-            "price": price,
-            "prev": price,
-            "history": [[0, price]],
-        }
+    if cfg.instruments:
+        for inst in cfg.instruments:
+            price = max(1, int(round(float(inst.ref_price or 1.0) * inst.price_scale)))
+            stocks[inst.code] = {
+                "code": inst.code,
+                "name": inst.name,
+                "kind": inst.kind,
+                "symbol": inst.symbol,
+                "sector": inst.sector,
+                "currency": inst.currency,
+                "price_scale": inst.price_scale,
+                "price_digits": inst.price_digits,
+                "price": price,
+                "prev": price,
+                "history": [[0, price]],
+            }
+    else:
+        # 模拟模式：沿用内置种子（离线兜底与单元测试基线）
+        for item in SEED_STOCKS:
+            price = int(item["price"])
+            stocks[item["code"]] = {
+                "code": item["code"],
+                "name": item.get("name", ""),
+                "kind": "stock",
+                "sector": item.get("sector", ""),
+                "currency": "CNY",
+                "price_scale": SCALE_STOCK,
+                "price_digits": 2,
+                "price": price,
+                "prev": price,
+                "history": [[0, price]],
+            }
     return {
         "group": group,
         "epoch": int(now),
@@ -87,29 +152,204 @@ def new_state(group: str, now: float, cfg: Config) -> dict[str, Any]:
     }
 
 
-def advance(state: dict[str, Any], now: float, cfg: Config) -> int:
-    """把行情补算到当前轮次，返回本次推进的轮数。
+def ensure_instruments(state: dict[str, Any], cfg: Config) -> int:
+    """让账本的品种表跟上当前配置（真实行情代码/外汇），返回被清算的品种数。
 
-    杠杆欠款按 UTC+8 自然日计息、按最新行情检查强平，两者都挂在这里，
-    因此不需要后台任务，容器重启后也能补算。
+    切换品种时旧持仓按最后价平仓、挂单撤销，资金回到现金，
+    避免升级后持仓因为「找不到行情」而凭空归零。
+    """
+    if not cfg.instruments:
+        return 0
+    wanted = {inst.code: inst for inst in cfg.instruments}
+    closed = 0
+    for code in list(state.get("stocks", {})):
+        if code in wanted:
+            continue
+        stock = state["stocks"][code]
+        closed += _close_out(state, stock)
+        state["stocks"].pop(code, None)
+
+    for code, inst in wanted.items():
+        stock = state["stocks"].get(code)
+        if stock is None:
+            price = max(1, int(round(float(inst.ref_price or 1.0) * inst.price_scale)))
+            state["stocks"][code] = {
+                "code": code,
+                "name": inst.name,
+                "kind": inst.kind,
+                "symbol": inst.symbol,
+                "sector": inst.sector,
+                "currency": inst.currency,
+                "price_scale": inst.price_scale,
+                "price_digits": inst.price_digits,
+                "price": price,
+                "prev": price,
+                "history": [[int(state.get("round", 0)), price]],
+            }
+            continue
+        stock["kind"] = inst.kind
+        stock["symbol"] = inst.symbol
+        stock["sector"] = inst.sector
+        stock["currency"] = inst.currency
+        stock["price_scale"] = inst.price_scale
+        stock["price_digits"] = inst.price_digits
+        if not stock.get("name"):
+            stock["name"] = inst.name
+        # 老账本可能带着模拟时代的停牌标记，实时行情下不再适用
+        stock.pop("delisted", None)
+        stock.pop("delisted_round", None)
+        stock.pop("delisted_at", None)
+        stock["below_rounds"] = 0
+    return closed
+
+
+def _close_out(state: dict[str, Any], stock: dict[str, Any]) -> int:
+    """下线一个品种：撤单、持仓按最后价无手续费平仓，返回涉及的账户数。"""
+    code = stock["code"]
+    price = int(stock.get("price") or 0)
+    for oid, order in list(state.get("orders", {}).items()):
+        if order.get("code") == code:
+            _refund_order(state, order)
+            state["orders"].pop(oid, None)
+
+    holders = 0
+    for acc in (state.get("accounts") or {}).values():
+        pos = (acc.get("positions") or {}).get(code)
+        if pos is None:
+            continue
+        shares = int(pos.get("shares") or 0)
+        if shares > 0 and price > 0:
+            amount = value_cents(stock, price, shares)
+            debt = int(pos.get("debt") or 0)
+            repay = min(debt, amount, int(acc.get("debt") or 0))
+            acc["cash"] = int(acc.get("cash", 0)) + amount - repay
+            acc["debt"] = max(0, int(acc.get("debt", 0)) - repay)
+            acc["realized"] = (
+                int(acc.get("realized", 0)) + amount - repay - int(pos.get("cost") or 0)
+            )
+            notices = acc.setdefault("notices", [])
+            notices.append(
+                f"🔄 市场切换：{display_label(stock)} 已按 {fmt_price(stock, price)} 结算，"
+                f"到账 {fmt_money(amount - repay)} 元。"
+            )
+            if len(notices) > 5:
+                del notices[: len(notices) - 5]
+            holders += 1
+        acc["positions"].pop(code, None)
+    return holders
+
+
+def advance(
+    state: dict[str, Any],
+    now: float,
+    cfg: Config,
+    quotes: dict[str, Any] | None = None,
+) -> int:
+    """把账本推进到当前时刻，返回本次推进的轮数。
+
+    真实行情模式：价格来自 `quotes`，轮次只做节拍；模拟模式：按轮次确定性游走。
+    杠杆欠款计息与强平检查两条路径都挂在这里，因此不需要后台任务。
     """
     target = current_round(state, now, cfg)
     advanced = 0
-    if target > state["round"]:
-        start = state["round"] + 1
-        if target - start + 1 > cfg.max_catchup:
-            # 长期无人使用后不逐个补算，直接跳到最近的窗口，避免卡死
-            start = max(1, target - cfg.max_catchup + 1)
-            state["round"] = start - 1
+    if cfg.data_source == "real":
+        advanced = max(0, target - int(state.get("round", 0)))
+        if target > int(state.get("round", 0)):
+            state["round"] = target
+        if quotes:
+            apply_quotes(state, quotes, now, cfg)
+        _process_orders(state, int(state.get("round", 0)), cfg)
+        _alert_moves(state, cfg, now)
+    else:
+        if target > state["round"]:
+            start = state["round"] + 1
+            if target - start + 1 > cfg.max_catchup:
+                # 长期无人使用后不逐个补算，直接跳到最近的窗口，避免卡死
+                start = max(1, target - cfg.max_catchup + 1)
+                state["round"] = start - 1
 
-        for round_no in range(start, target + 1):
-            _apply_round(state, round_no, cfg)
-            state["round"] = round_no
-        advanced = target - start + 1
+            for round_no in range(start, target + 1):
+                _apply_round(state, round_no, cfg)
+                state["round"] = round_no
+            advanced = target - start + 1
 
     _accrue_interest(state, now, cfg)
     _check_liquidations(state, now, cfg)
     return advanced
+
+
+def apply_quotes(
+    state: dict[str, Any], quotes: dict[str, Any], now: float, cfg: Config
+) -> int:
+    """把真实行情写进账本：最新价、昨收（涨跌基准）、开高低与走势点。"""
+    round_no = int(state.get("round", 0))
+    changed = 0
+    for code, stock in state.get("stocks", {}).items():
+        quote = quotes.get(code)
+        if quote is None:
+            continue
+        scale = price_scale(stock)
+        last = int(round(float(getattr(quote, "last", 0.0)) * scale))
+        prev = int(round(float(getattr(quote, "prev_close", 0.0)) * scale)) or last
+        if last <= 0:
+            continue
+
+        if not stock.get("name"):
+            stock["name"] = str(getattr(quote, "name", "") or "")
+        stock["price"] = last
+        stock["prev"] = prev
+        for key, field in (("open", "open"), ("high", "high"), ("low", "low")):
+            raw = float(getattr(quote, field, 0.0) or 0.0)
+            if raw > 0:
+                stock[key] = int(round(raw * scale))
+        stock["quote_ts"] = float(getattr(quote, "ts", 0.0) or now)
+        stock.pop("delisted", None)
+
+        history = stock.setdefault("history", [])
+        if not history or history[-1][1] != last or history[-1][0] != round_no:
+            history.append([round_no, last])
+            if len(history) > MAX_HISTORY:
+                del history[: len(history) - MAX_HISTORY]
+        changed += 1
+    return changed
+
+
+def _alert_moves(state: dict[str, Any], cfg: Config, now: float) -> None:
+    """真实行情下把当日异动写成新闻播报，每品种每天只播一次。"""
+    threshold = float(getattr(cfg, "alert_pct", 0.0) or 0.0)
+    if threshold <= 0:
+        return
+    day = day_key(now)
+    alerted = state.setdefault("alerted", {})
+    news = state.setdefault("news", [])
+    for code, stock in state.get("stocks", {}).items():
+        pct = stock_pct(stock)
+        if abs(pct) < threshold:
+            continue
+        key = f"{code}:{day}"
+        if alerted.get(key):
+            continue
+        alerted[key] = 1
+        direction = "上涨" if pct > 0 else "下跌"
+        news.append(
+            {
+                "round": int(state.get("round", 0)),
+                "ts": int(now),
+                "code": code,
+                "pct": round(pct, 2),
+                "tier": "real",
+                "tier_label": "行情异动",
+                "text": (
+                    f"【行情异动】{display_name(stock)} 当日{direction} {pct:+.2f}%，"
+                    f"现价 {fmt_price(stock, int(stock['price']))}。"
+                ),
+            }
+        )
+    if len(news) > news_mod.MAX_NEWS:
+        del news[: len(news) - news_mod.MAX_NEWS]
+    if len(alerted) > 400:
+        for key in list(alerted)[:200]:
+            alerted.pop(key, None)
 
 
 def _apply_round(state: dict[str, Any], round_no: int, cfg: Config) -> None:
@@ -224,13 +464,13 @@ def _delist(
         if shares <= 0:
             continue
         pos["frozen"] = 0
-        result = _settle_sale(acc, pos, shares, price, cfg)
+        result = _settle_sale(acc, pos, shares, price, cfg, stock)
         _record_trade(state, user, "delist", "sell", code, shares, price, result["fee"])
         holders += 1
         text = (
             f"📉 退市清盘：{display_label(stock)} 连续 {cfg.delist_rounds} 轮低于 "
             f"{fmt_money(cfg.delist_price)} 元，你的 {shares} 股已按 "
-            f"{fmt_money(price, comma=False)} 元强制卖出，到账 {fmt_money(result['proceeds'])} 元。"
+            f"{fmt_price(stock, price)} 元强制卖出，到账 {fmt_money(result['proceeds'])} 元。"
         )
         if result["repay"] > 0:
             text += f"其中 {fmt_money(result['repay'])} 元已偿还欠款。"
@@ -368,7 +608,7 @@ def _process_orders(state: dict[str, Any], round_no: int, cfg: Config) -> None:
             state["orders"].pop(str(order["id"]), None)
             continue
         if _is_favorable(order["side"], stock["price"], int(order["limit"])):
-            _execute_order(state, order, stock["price"], cfg)
+            _execute_order(state, order, stock, int(stock["price"]), cfg)
 
 
 # --------------------------------------------------------------------------- #
@@ -418,8 +658,13 @@ def position_of(acc: dict[str, Any], code: str, create: bool = False) -> dict[st
     return pos
 
 
-def is_known_code(code: str) -> bool:
-    return any(item["code"] == (code or "").upper() for item in SEED_STOCKS)
+def is_known_code(code: str, cfg: Config | None = None) -> bool:
+    key = (code or "").upper()
+    if any(item["code"] == key for item in SEED_STOCKS):
+        return True
+    if cfg is not None and cfg.instruments:
+        return any(inst.code == key for inst in cfg.instruments)
+    return False
 
 
 def find_stock(state: dict[str, Any], key: str) -> dict[str, Any]:
@@ -474,28 +719,30 @@ def display_label(stock: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------- #
 
 
-def _check_shares(shares: Any) -> int:
+def _check_shares(shares: Any, stock: dict[str, Any] | None = None) -> int:
     try:
         value = int(str(shares).strip())
     except (TypeError, ValueError):
-        raise MarketError("股数必须是正整数。")
+        raise MarketError(f"{unit_label(stock)}数必须是正整数。")
     if value <= 0:
-        raise MarketError("股数必须是正整数。")
+        raise MarketError(f"{unit_label(stock)}数必须是正整数。")
     if value > MAX_SHARES:
-        raise MarketError("单笔股数过大。")
+        raise MarketError(f"单笔{unit_label(stock)}数过大。")
     return value
 
 
-def _check_price(price: Any) -> int:
+def _check_price(price: Any, stock: dict[str, Any] | None = None) -> int:
     text = str(price).strip()
     try:
         value = Decimal(text)
     except Exception:
-        raise MarketError("价格格式不正确，例如 9.50。")
-    cents = int((value * 100).to_integral_value(rounding=ROUND_CEILING))
-    if cents <= 0:
+        digits = price_digits(stock)
+        raise MarketError(f"价格格式不正确，例如 9.50 或 0.041805（最多 {digits} 位小数）。")
+    scale = price_scale(stock)
+    units = int((value * scale).to_integral_value(rounding=ROUND_CEILING))
+    if units <= 0:
         raise MarketError("价格必须大于 0。")
-    return cents
+    return units
 
 
 def _consume_cost(pos: dict[str, int], shares: int) -> int:
@@ -508,15 +755,20 @@ def _consume_cost(pos: dict[str, int], shares: int) -> int:
 
 
 def _settle_sale(
-    acc: dict[str, Any], pos: dict[str, Any], count: int, price: int, cfg: Config
+    acc: dict[str, Any],
+    pos: dict[str, Any],
+    count: int,
+    price: int,
+    cfg: Config,
+    stock: dict[str, Any] | None = None,
 ) -> dict[str, int]:
-    """按市价卖出 count 股并结算杠杆欠款，返回本次成交的各项金额。
+    """按市价卖出 count 单位并结算杠杆欠款，返回本次成交的各项金额。
 
-    杠杆持仓卖出时按股数比例偿还欠款；极端情况下成交额不足以还清，
+    杠杆持仓卖出时按数量比例偿还欠款；极端情况下成交额不足以还清，
     差额留在账户欠款里，后续资金自动优先偿还。
     """
     held = int(pos["shares"])
-    amount = price * count
+    amount = value_cents(stock, price, count)
     fee = calc_fee(amount, cfg)
     proceeds = amount - fee
 
@@ -584,11 +836,15 @@ def _record_trade(
 def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -> dict[str, Any]:
     stock = find_stock(state, key)
     require_tradable(stock, cfg)
-    count = _check_shares(shares)
+    count = _check_shares(shares, stock)
     acc = require_account(state, user)
 
     price = int(stock["price"])
-    amount = price * count
+    amount = value_cents(stock, price, count)
+    if amount <= 0:
+        raise MarketError(
+            f"成交金额不足 0.01 元，请增加{unit_label(stock)}数量。"
+        )
     fee = calc_fee(amount, cfg)
     total = amount + fee
     if acc["cash"] < total:
@@ -608,6 +864,9 @@ def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) ->
         "label": display_label(stock),
         "shares": count,
         "price": price,
+        "price_text": fmt_price(stock, price),
+        "currency": currency_of(stock),
+        "unit": unit_label(stock),
         "fee": fee,
         "total": total,
         "cash": acc["cash"],
@@ -617,17 +876,20 @@ def buy(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) ->
 def sell(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -> dict[str, Any]:
     stock = find_stock(state, key)
     require_tradable(stock, cfg)
-    count = _check_shares(shares)
+    count = _check_shares(shares, stock)
     acc = require_account(state, user)
 
     pos = position_of(acc, stock["code"])
     held = int(pos["shares"]) if pos else 0
     available = held - int(pos["frozen"]) if pos else 0
     if count > available:
-        raise MarketError(f"可卖股份不足：持有 {held} 股，可卖 {available} 股（不支持做空）。")
+        raise MarketError(
+            f"可卖数量不足：持有 {held} {unit_label(stock)}，"
+            f"可卖 {available} {unit_label(stock)}（不支持做空）。"
+        )
 
     price = int(stock["price"])
-    result = _settle_sale(acc, pos, count, price, cfg)
+    result = _settle_sale(acc, pos, count, price, cfg, stock)
     _record_trade(state, user, "market", "sell", stock["code"], count, price, result["fee"])
 
     return {
@@ -636,8 +898,12 @@ def sell(state: dict[str, Any], user: str, key: str, shares: Any, cfg: Config) -
         "label": display_label(stock),
         "shares": count,
         "price": price,
+        "price_text": fmt_price(stock, price),
+        "currency": currency_of(stock),
+        "unit": unit_label(stock),
         "fee": result["fee"],
         "proceeds": result["proceeds"],
+        "amount": result["amount"],
         "cash": acc["cash"],
         "realized": result["pnl"],
         "repaid": result["repay"],
@@ -676,7 +942,7 @@ def leverage_buy(
         raise MarketError("本群没有开启杠杆玩法。")
     stock = find_stock(state, key)
     require_tradable(stock, cfg)
-    count = _check_shares(shares)
+    count = _check_shares(shares, stock)
     leverage = _parse_leverage(leverage_text, cfg)
     acc = require_account(state, user)
 
@@ -687,7 +953,11 @@ def leverage_buy(
         )
 
     price = int(stock["price"])
-    amount = price * count
+    amount = value_cents(stock, price, count)
+    if amount <= 0:
+        raise MarketError(
+            f"成交金额不足 0.01 元，请增加{unit_label(stock)}数量。"
+        )
     fee = calc_fee(amount, cfg)
     margin = int(
         (Decimal(amount) / Decimal(str(leverage))).to_integral_value(rounding=ROUND_CEILING)
@@ -715,6 +985,9 @@ def leverage_buy(
         "label": display_label(stock),
         "shares": count,
         "price": price,
+        "price_text": fmt_price(stock, price),
+        "currency": currency_of(stock),
+        "unit": unit_label(stock),
         "leverage": leverage,
         "fee": fee,
         "margin": margin,
@@ -741,13 +1014,14 @@ def place_order(
 ) -> dict[str, Any]:
     stock = find_stock(state, key)
     require_tradable(stock, cfg)
-    count = _check_shares(shares)
-    limit = _check_price(price_text)
+    count = _check_shares(shares, stock)
+    limit = _check_price(price_text, stock)
     acc = require_account(state, user)
     code = stock["code"]
 
     if side == "buy":
-        frozen = count * limit + calc_fee(count * limit, cfg)
+        notional = value_cents(stock, limit, count)
+        frozen = notional + calc_fee(notional, cfg)
         if acc["cash"] < frozen:
             raise MarketError(
                 f"可用资金不足：需要冻结 {fmt_money(frozen)} 元，当前可用 {fmt_money(acc['cash'])} 元。"
@@ -760,7 +1034,8 @@ def place_order(
         frozen_shares = int(pos["frozen"]) if pos else 0
         if count > held - frozen_shares:
             raise MarketError(
-                f"可卖股份不足：持有 {held} 股，可卖 {held - frozen_shares} 股。"
+                f"可卖数量不足：持有 {held} {unit_label(stock)}，"
+                f"可卖 {held - frozen_shares} {unit_label(stock)}。"
             )
         pos = position_of(acc, code, create=True)
         pos["frozen"] += count
@@ -784,19 +1059,23 @@ def place_order(
     executed_at = None
     market_price = int(stock["price"])
     if _is_favorable(side, market_price, limit):
-        _execute_order(state, order, market_price, cfg)
+        _execute_order(state, order, stock, market_price, cfg)
         executed_at = market_price
 
     return {"order": order, "executed_at": executed_at, "stock": stock}
 
 
 def _execute_order(
-    state: dict[str, Any], order: dict[str, Any], price: int, cfg: Config
+    state: dict[str, Any],
+    order: dict[str, Any],
+    stock: dict[str, Any],
+    price: int,
+    cfg: Config,
 ) -> None:
     acc = state["accounts"][order["user"]]
     code = order["code"]
     count = int(order["shares"])
-    amount = price * count
+    amount = value_cents(stock, price, count)
     fee = calc_fee(amount, cfg)
     pos = position_of(acc, code, create=True)
 
@@ -811,7 +1090,7 @@ def _execute_order(
         pos["frozen"] -= count
         if pos["frozen"] < 0:
             pos["frozen"] = 0
-        _settle_sale(acc, pos, count, price, cfg)
+        _settle_sale(acc, pos, count, price, cfg, stock)
 
     state["orders"].pop(str(order["id"]), None)
     _record_trade(state, order["user"], "limit", order["side"], code, count, price, fee)
@@ -872,7 +1151,7 @@ def account_total(state: dict[str, Any], acc: dict[str, Any]) -> int:
             continue
         stock = state["stocks"].get(code)
         if stock:
-            total += int(stock["price"]) * shares
+            total += value_cents(stock, int(stock["price"]), shares)
     return total
 
 
@@ -957,17 +1236,17 @@ def _check_liquidations(state: dict[str, Any], now: float, cfg: Config) -> None:
             if stock is None or is_delisted(stock):
                 continue
             price = int(stock["price"])
-            value = price * shares
+            value = value_cents(stock, price, shares)
             equity = value - debt
             if equity > 0 and equity >= value * cfg.margin_call_ratio:
                 continue
 
             _cancel_sell_orders(state, user, code)
-            result = _settle_sale(acc, pos, shares, price, cfg)
+            result = _settle_sale(acc, pos, shares, price, cfg, stock)
             label = display_label(stock)
             text = (
-                f"⚠️ 强平：{label} {shares} 股已按 "
-                f"{fmt_money(price, comma=False)} 元强制卖出，"
+                f"⚠️ 强平：{label} {shares} {unit_label(stock)}已按 "
+                f"{fmt_price(stock, price)} 元强制卖出，"
                 f"偿还欠款 {fmt_money(result['repay'])} 元。"
             )
             left = int(acc.get("debt", 0))
@@ -1019,14 +1298,17 @@ def leverage_info(state: dict[str, Any], user: str, cfg: Config) -> dict[str, An
             continue
         stock = state["stocks"].get(code)
         price = int(stock["price"]) if stock else 0
-        value = price * shares
+        value = value_cents(stock, price, shares) if stock else 0
         equity = value - pos_debt
         ratio = (equity / value * 100.0) if value > 0 else 0.0
         keep = max(0.0001, 1.0 - float(cfg.margin_call_ratio))
+        scale = price_scale(stock)
         liq_price = int(
-            (Decimal(pos_debt) / Decimal(str(shares * keep))).to_integral_value(
-                rounding=ROUND_CEILING
-            )
+            (
+                Decimal(pos_debt)
+                * Decimal(scale)
+                / (Decimal(str(shares * keep)) * Decimal(100))
+            ).to_integral_value(rounding=ROUND_CEILING)
         )
         rows.append(
             {
@@ -1034,6 +1316,9 @@ def leverage_info(state: dict[str, Any], user: str, cfg: Config) -> dict[str, An
                 "label": display_label(stock) if stock else code,
                 "shares": shares,
                 "price": price,
+                "price_text": fmt_price(stock, price) if stock else "0.00",
+                "liq_price_text": fmt_price(stock, liq_price) if stock else "0.00",
+                "unit": unit_label(stock),
                 "debt": pos_debt,
                 "value": value,
                 "equity": equity,
@@ -1161,7 +1446,9 @@ def pnl_of(state: dict[str, Any], acc: dict[str, Any]) -> tuple[int, int]:
         if stock is None:
             continue
         floating += (
-            int(stock["price"]) * shares - int(pos.get("debt", 0)) - int(pos.get("cost", 0))
+            value_cents(stock, int(stock["price"]), shares)
+            - int(pos.get("debt", 0))
+            - int(pos.get("cost", 0))
         )
     return realized, floating
 
@@ -1391,11 +1678,15 @@ def clear_cash(state: dict[str, Any], target: Any) -> dict[str, Any]:
 
 
 def quote_page(
-    state: dict[str, Any], page: int, cfg: Config
+    state: dict[str, Any], page: int, cfg: Config, kind: str | None = None
 ) -> tuple[list[dict[str, Any]], int, int]:
-    codes = sorted(state["stocks"])
+    codes = sorted(
+        code
+        for code, stock in state["stocks"].items()
+        if kind is None or (stock.get("kind") or "stock") == kind
+    )
     size = max(1, cfg.page_size)
-    pages = max(1, math.ceil(len(codes) / size))
+    pages = max(1, math.ceil(len(codes) / size)) if codes else 1
     page = max(1, min(pages, page))
     chunk = codes[(page - 1) * size : page * size]
     rows = []
@@ -1406,8 +1697,15 @@ def quote_page(
                 "code": code,
                 "name": stock.get("name") or "",
                 "price": int(stock["price"]),
+                "price_text": fmt_price(stock, int(stock["price"])),
                 "pct": stock_pct(stock),
                 "delisted": is_delisted(stock),
+                "kind": stock.get("kind") or "stock",
+                "currency": currency_of(stock),
+                "digits": price_digits(stock),
+                "open": stock.get("open"),
+                "high": stock.get("high"),
+                "low": stock.get("low"),
             }
         )
     return rows, page, pages
@@ -1424,7 +1722,7 @@ def account_summary(state: dict[str, Any], user: str) -> dict[str, Any]:
             continue
         stock = state["stocks"].get(code)
         price = int(stock["price"]) if stock else 0
-        value = price * shares
+        value = value_cents(stock, price, shares) if stock else 0
         market_value += value
         cost_total += int(pos.get("cost", 0))
         debt = int(pos.get("debt", 0))
@@ -1438,6 +1736,10 @@ def account_summary(state: dict[str, Any], user: str) -> dict[str, Any]:
                 "cost": int(pos.get("cost", 0)),
                 "debt": debt,
                 "price": price,
+                "price_text": fmt_price(stock, price) if stock else "0.00",
+                "currency": currency_of(stock) if stock else "CNY",
+                "kind": (stock or {}).get("kind") or "stock",
+                "unit": unit_label(stock),
                 "value": value,
                 "floating": value - debt - int(pos.get("cost", 0)),
             }
