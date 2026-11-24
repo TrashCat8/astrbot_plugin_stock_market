@@ -1,4 +1,72 @@
 {
+  "broke_broadcast": {
+    "description": "资产清零播报",
+    "type": "bool",
+    "default": true,
+    "hint": "某人净资产（可用 + 冻结 + 持仓市值 − 欠款）跌到 ≤ 0 时，在群里播报「💥 昵称 空中飞人了」。每人只播一次，净值回正后再次爆仓会再播。"
+  },
+  "interactive_buttons": {
+    "description": "卡片附带可点击按钮",
+    "type": "bool",
+    "default": true,
+    "hint": "在行情/持仓/帮助卡片后附一行按钮（行情、汇市、持仓、签到、排行等），点击等价于发一条对应指令。需要 AstrBot >= 4.29.4 且适配器支持按钮（QQ 官方 / aiocqhttp 均可）；老版本会自动跳过。"
+  },
+  "text_chain": {
+    "description": "正文附带可点指令链",
+    "type": "bool",
+    "default": true,
+    "hint": "仅在 QQ 官方机器人（Markdown 消息）生效：正文末尾追加 <qqbot-cmd-input> 标签，点击后把「/股市 行情 1」填进输入框。其它平台自动跳过，不会显示成乱码标签。"
+  },
+  "data_source": {
+    "description": "行情来源",
+    "type": "string",
+    "default": "real",
+    "options": ["real", "simulated"],
+    "labels": ["真实行情（腾讯/新浪）", "本地模拟"],
+    "hint": "real 用腾讯股票 + 新浪外汇的真实报价，价格随市场变化；simulated 是插件原本的本地随机游走，适合断网或纯测试。"
+  },
+  "refresh_seconds": {
+    "description": "真实行情缓存秒数",
+    "type": "int",
+    "default": 60,
+    "hint": "同一批报价在这个时间内复用缓存，避免每次指令都打行情接口。最小 15 秒。"
+  },
+  "alert_moves_pct": {
+    "description": "异动播报阈值（%）",
+    "type": "float",
+    "default": 3.0,
+    "hint": "真实行情下，某品种当日涨跌超过这个幅度会记一条「行情异动」新闻（每品种每天一条）。填 0 关闭。"
+  },
+  "fx_enabled": {
+    "description": "开启外汇交易",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 /股市 汇市 可看外汇行情，FX_USDCNY 这类代码可直接买卖、挂限价单、加杠杆。报价来自新浪外汇（人民币计价，精确到 6 位小数）。"
+  },
+  "symbols": {
+    "description": "股票池（留空用默认）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "格式 sh600519 或 sh600519:贵州茅台。支持 sh/sz（A 股）、hk（港股）、us（美股）前缀；留空使用内置默认池（茅台、平安银行、宁德时代、腾讯、苹果、英伟达等）。"
+  },
+  "fx_pairs": {
+    "description": "外汇对（留空用默认）",
+    "type": "list",
+    "default": [],
+    "items": {
+      "type": "string"
+    },
+    "hint": "写 USD、EUR、JPY 这类货币代码（会自动补 CNY），留空默认 USD/EUR/JPY/HKD/GBP/AUD。"
+  },
+  "quote_timeout": {
+    "description": "行情接口超时（秒）",
+    "type": "float",
+    "default": 6.0,
+    "hint": "抓取行情的网络超时；失败时沿用上一帧报价，不会阻塞交易指令。"
+  },
   "initial_capital": {
     "description": "开户初始资金（元）",
     "type": "float",

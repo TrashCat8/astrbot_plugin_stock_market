@@ -43,6 +43,45 @@ def test_admin_lists_default_empty() -> None:
     assert Config.from_plugin_config({"rename_admins": [" 10002 ", ""]}).rename_admins == ["10002"]
 
 
+def test_broke_broadcast_fires_once_and_resets() -> None:
+    """净资产 ≤0 只播一次；回正后再次爆仓还能再播。"""
+    cfg = Config()
+    state = fresh()
+    acc = engine.ensure_account(state, "u1", cfg)
+    acc["cash"] = 0
+    acc["positions"] = {}
+    acc["debt"] = 0
+
+    alerts = engine.detect_broke(state)
+    assert len(alerts) == 1, alerts
+    assert alerts[0]["user"] == "u1"
+    assert alerts[0]["net"] == 0
+    assert acc["broke"] is True
+    assert engine.detect_broke(state) == []
+
+    acc["cash"] = 1
+    assert engine.detect_broke(state) == []
+    assert not acc.get("broke")
+
+    acc["cash"] = 0
+    assert len(engine.detect_broke(state)) == 1
+
+
+def test_broke_broadcast_ignores_negative_debt_with_assets() -> None:
+    """欠款超过资产算爆仓（net<0），有资产但欠款少的不算。"""
+    cfg = Config()
+    state = fresh()
+    acc = engine.ensure_account(state, "u1", cfg)
+    acc["cash"] = 1_000_000
+    acc["debt"] = 500_000
+    assert engine.detect_broke(state) == []
+    assert engine.account_net(state, acc) == 500_000
+
+    acc["debt"] = 2_000_000
+    alerts = engine.detect_broke(state)
+    assert len(alerts) == 1 and alerts[0]["net"] == -1_000_000
+
+
 def test_fee_rounds_up() -> None:
     assert engine.calc_fee(50_000, CFG) == 50, engine.calc_fee(50_000, CFG)
     assert engine.calc_fee(1, CFG) == 1
