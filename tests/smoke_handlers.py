@@ -126,10 +126,15 @@ async def main() -> int:
     def check(name: str, result, expect_type: str = "text") -> dict:
         items = list(result) if isinstance(result, (list, tuple)) else [result]
         first = items[0]
-        ok = first.get("type") == expect_type
+        ok = first.get("type") == expect or (
+            expect == "text" and first.get("type") == "chain"
+        )_type
         if expect_type == "image":
             ok = ok and first.get("size", 0) > 1000
-        detail = first.get("text", "").splitlines()[0] if expect_type == "text" else f"{first.get('size')} bytes"
+        body = first.get("text") or "".join(
+            getattr(comp, "text", "") for comp in getattr(first, "chain", []) if isinstance(comp, Plain)
+        )
+        detail = (body.splitlines()[0] if body else "(空)") if expect_type == "text" else f"{first.get('size')} bytes"
         print(("OK   " if ok else "FAIL ") + f"{name}: {detail}")
         if not ok:
             failures.append(name)

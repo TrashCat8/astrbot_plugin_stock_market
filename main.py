@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -337,6 +338,9 @@ class StockMarketPlugin(Star):
 
         plain = self._plain_text_of(last)
         if plain is not None:
+            if len(plain) > 1500:
+                # 平台文本长度有限，超长正文先保消息本身，按钮/链一律不加
+                return result
             text = interactive.with_links(plain, links) if want_links else plain
             chain = [interactive.Plain(text)]
             if row is not None:
@@ -424,7 +428,13 @@ class StockMarketPlugin(Star):
             if arg and not arg.isdigit():
                 stock = engine.find_stock(state, arg)
                 detail = self._detail_text(stock, cfg, int(state["round"]))
-                return self._interactive(event, cfg, event.plain_result(detail), (), ())
+                return self._interactive(
+                    event,
+                    cfg,
+                    event.plain_result(detail),
+                    () if text_only else interactive.QUOTE_BUTTONS,
+                    interactive.QUOTE_LINKS,
+                )
 
             page_no = int(arg) if arg.isdigit() else 1
             rows, page, pages = engine.quote_page(state, page_no, cfg, kind=kind)
@@ -502,8 +512,22 @@ class StockMarketPlugin(Star):
             notes = engine.pop_notices(engine.require_account(state, user))
             round_no = int(state["round"])
             updated = engine.fmt_time(time.time())
-            text = textfmt.position_text(summary, round_no)
-            out = self.store.cache_file(f"position_{namespace}_{round_no}.png")
+
+            # 持仓可能很多（17 个品种全买），按 page_size 分页，避免一张卡长到看不清；
+            # 持仓行高比行情行高，单页再压到最多 6 行
+            size = max(1, min(6, cfg.page_size))
+            all_rows = summary["positions"]
+            total = len(all_rows)
+            pages = max(1, math.ceil(total / size))
+            page = int(rest[0]) if rest and rest[0].isdigit() else 1
+            page = max(1, min(pages, page))
+            view = dict(summary)
+            view["positions"] = all_rows[(page - 1) * size : page * size]
+
+            text = textfmt.position_text(view, round_no, page, pages, total)
+            out = self.store.cache_file(
+                f"position_{namespace}_{page}_{round_no}.png"
+            )
 
         if text_only or not self._card_ok(cfg):
             return self._interactive(
@@ -514,7 +538,15 @@ class StockMarketPlugin(Star):
                 interactive.POSITION_LINKS,
             )
         try:
-            render.render_position(summary, round_no, updated, out=out)
+            render.render_position(
+                view,
+                round_no,
+                updated,
+                out=out,
+                page=page,
+                pages=pages,
+                total_positions=total,
+            )
         except Exception:
             logger.exception("[stock] 持仓卡渲染失败，回退文字")
             return self._interactive(
@@ -625,7 +657,7 @@ class StockMarketPlugin(Star):
             lines.append(
                 f"  现价 {row['price_text']} · 市值 {engine.fmt_money(row['value'])} 元 · "
                 f"权益比 {row['ratio']:.1f}% · "
-                f"强平价 {row['liq_price_text']}"
+                f"强平价 {row['liq_price_text']} 元"
             )
         lines.append(
             f"权益/市值低于 {info['call_ratio'] * 100:.0f}% 时自动强平；"
@@ -700,10 +732,12 @@ class StockMarketPlugin(Star):
                 stock = state["stocks"].get(order["code"]) or {"code": order["code"]}
                 side_text = "买入" if order["side"] == "buy" else "卖出"
                 remain = max(0, int(order["expire_round"]) - round_no)
+                hours = remain * cfg.round_seconds / 3600
+                remain_text = f"{hours:.1f} 小时" if hours >= 1 else f"{max(1, int(hours * 60))} 分钟"
                 lines.append(
                     f"#{order['id']} {side_text} {order['code']} {order['shares']} "
                     f"{engine.unit_label(stock)} @ "
-                    f"{engine.fmt_price(stock, int(order['limit']))} 元（还剩 {remain} 轮）"
+                    f"{engine.fmt_price(stock, int(order['limit']))} 元（还剩约 {remain_text}）"
                 )
 
         if not orders:
@@ -781,6 +815,7 @@ class StockMarketPlugin(Star):
                 "price_scale": engine.price_scale(stock),
                 "price_digits": engine.price_digits(stock),
                 "prev": int(stock.get("prev") or stock["price"]),
+                "quote_ts": stock.get("quote_ts"),
                 "history": [list(item) for item in stock.get("history", [])],
             }
             text = textfmt.chart_text(snapshot)
@@ -1165,12 +1200,14 @@ class StockMarketPlugin(Star):
         history = [int(p) for _, p in stock.get("history", [])] or [int(stock["price"])]
         unit = engine.unit_label(stock)
         prev = int(stock.get("prev") or stock["price"])
+        # 真实行情有当日高低就用它做区间，模拟模式退回历史点
+        low = int(stock.get("low") or min(history))
+        high = int(stock.get("high") or max(history))
         lines = [
             engine.display_label(stock),
             f"现价 {engine.fmt_price(stock, int(stock['price']))} 元/{unit} {engine.fmt_pct(pct)}",
             f"昨收 {engine.fmt_price(stock, prev)} 元 · "
-            f"区间 {engine.fmt_price(stock, min(history))} ~ "
-            f"{engine.fmt_price(stock, max(history))} 元",
+            f"区间 {engine.fmt_price(stock, low)} ~ {engine.fmt_price(stock, high)} 元",
         ]
         if stock.get("open"):
             lines.append(

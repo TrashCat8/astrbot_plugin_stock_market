@@ -296,6 +296,7 @@ def apply_quotes(
 
         if not stock.get("name"):
             stock["name"] = str(getattr(quote, "name", "") or "")
+        first_quote = not stock.get("quote_ts")
         stock["price"] = last
         stock["prev"] = prev
         for key, field in (("open", "open"), ("high", "high"), ("low", "low")):
@@ -306,7 +307,10 @@ def apply_quotes(
         stock.pop("delisted", None)
 
         history = stock.setdefault("history", [])
-        if not history or history[-1][1] != last or history[-1][0] != round_no:
+        if first_quote:
+            # 首次拿到真实报价：丢掉建仓时用参考价画的假起点，避免"区间"凭空多出高位
+            history[:] = [[round_no, last]]
+        elif not history or history[-1][1] != last or history[-1][0] != round_no:
             history.append([round_no, last])
             if len(history) > MAX_HISTORY:
                 del history[: len(history) - MAX_HISTORY]
@@ -1703,6 +1707,7 @@ def quote_page(
                 "kind": stock.get("kind") or "stock",
                 "currency": currency_of(stock),
                 "digits": price_digits(stock),
+                "price_scale": price_scale(stock),
                 "open": stock.get("open"),
                 "high": stock.get("high"),
                 "low": stock.get("low"),

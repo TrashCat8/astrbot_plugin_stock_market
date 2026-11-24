@@ -26,13 +26,22 @@ def quote_text(
             lines.append(f"{label} 已停牌（{price}{suffix}）")
             continue
         lines.append(f"{label} {price}{suffix} {fmt_pct(row['pct'])}")
-    lines.append(f"第 {round_no} 轮 · 每 {refresh_seconds} 秒刷新")
+    lines.append(f"每 {refresh_seconds} 秒刷新")
     return "\n".join(lines)
 
 
-def position_text(summary: dict[str, Any], round_no: int) -> str:
+def position_text(
+    summary: dict[str, Any],
+    round_no: int,
+    page: int = 1,
+    pages: int = 1,
+    total_positions: int | None = None,
+) -> str:
+    rows = summary["positions"]
+    total = total_positions if total_positions is not None else len(rows)
+    head = "【持仓】" if pages <= 1 else f"【持仓 {page}/{pages}】"
     lines = [
-        f"【持仓】第 {round_no} 轮",
+        head,
         f"可用 {fmt_money(summary['cash'])} 元 · 冻结 {fmt_money(summary['frozen'])} 元",
         f"持仓市值 {fmt_money(summary['market_value'])} 元",
         f"总资产 {fmt_money(summary['total'])} 元",
@@ -41,11 +50,12 @@ def position_text(summary: dict[str, Any], round_no: int) -> str:
         f"累计已实现盈亏 {fmt_money(summary['realized'])} 元",
         f"浮动盈亏 {fmt_money(summary['floating'])} 元",
     ]
-    rows = summary["positions"]
     if not rows:
         lines.append("持仓 0：暂无持仓")
         return "\n".join(lines)
-    lines.append(f"持仓 {len(rows)}")
+    lines.append(
+        f"持仓 {total}" + (f"（本页 {len(rows)}）" if pages > 1 else "")
+    )
     for pos in rows:
         unit = pos.get("unit") or "股"
         lines.append(
@@ -70,7 +80,7 @@ def chart_text(stock: dict[str, Any]) -> str:
 
 
 def rank_text(rows: Sequence[dict[str, Any]], round_no: int) -> str:
-    lines = [f"【本群资产排行】第 {round_no} 轮"]
+    lines = [f"【本群资产排行】共 {len(rows)} 人"]
     for index, row in enumerate(rows):
         lines.append(
             f"{index + 1}. {row['name']}：{fmt_money(row['total'])} 元"
@@ -81,7 +91,7 @@ def rank_text(rows: Sequence[dict[str, Any]], round_no: int) -> str:
 
 
 def profit_text(data: dict[str, list[dict[str, Any]]], round_no: int) -> str:
-    lines = [f"【本群盈亏榜】第 {round_no} 轮"]
+    lines = ["【本群盈亏榜】"]
 
     def block(title: str, rows: list[dict[str, Any]]) -> None:
         lines.append(title)

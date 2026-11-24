@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from decimal import Decimal
 from pathlib import Path
 from typing import Any, Sequence
@@ -106,6 +107,23 @@ def _canvas(height: int) -> tuple[Image.Image, ImageDraw.ImageDraw]:
     return img, ImageDraw.Draw(img)
 
 
+_SYMBOL_KEEP = set("·—…°±")
+
+def _clean_text(text: object) -> str:
+    """丢弃字体画不出来的字符（emoji / 代理对 / 控制符），避免昵称变成一排豆腐块。"""
+    out: list[str] = []
+    for ch in str(text or ""):
+        code = ord(ch)
+        if code == 0x200D or 0xFE00 <= code <= 0xFE0F:
+            continue
+        if code > 0xFFFF or 0xD800 <= code <= 0xDFFF:
+            continue
+        if unicodedata.category(ch) in ("So", "Cs", "Cc", "Cf") and ch not in _SYMBOL_KEEP:
+            continue
+        out.append(ch)
+    return "".join(out).strip()
+
+
 def _price(cents: int) -> str:
     return f"{Decimal(int(cents)) / 100:.2f}"
 
@@ -188,7 +206,7 @@ def render_quote(
         if index % 2 == 1:
             draw.rounded_rectangle((32, y - row_h // 2, WIDTH - 32, y + row_h // 2), radius=10, fill=PANEL_ALT)
         draw.text((44, y), row["code"], font=_font(19, True), fill=TEXT, anchor="lm")
-        name = row.get("name") or "—"
+        name = _clean_text(row.get("name")) or "—"
         draw.text((214, y), name, font=_font(19), fill=TEXT, anchor="lm")
         price_text = row.get("price_text") or _fmt_price(
             int(row["price"]), int(row.get("price_scale") or 100), int(row.get("digits") or 2)
@@ -225,8 +243,12 @@ def render_position(
     updated_at: str,
     *,
     out: Path,
+    page: int = 1,
+    pages: int = 1,
+    total_positions: int | None = None,
 ) -> Path:
     rows = summary["positions"]
+    total = total_positions if total_positions is not None else len(rows)
     items = [
         ("可用资金", f"{_money(summary['cash'])} 元", TEXT),
         ("冻结资金", f"{_money(summary['frozen'])} 元", TEXT),
@@ -248,9 +270,10 @@ def render_position(
     img, draw = _canvas(height)
 
     draw.text((36, 52), "【持仓】", font=_font(29, True), fill=TEXT, anchor="lm")
+    subtitle = updated_at if pages <= 1 else f"{updated_at} · 第 {page}/{pages} 页"
     draw.text(
         (36, 90),
-        f"第 {round_no} 轮 · {updated_at}",
+        subtitle,
         font=_font(16),
         fill=MUTED,
         anchor="lm",
@@ -265,7 +288,7 @@ def render_position(
 
     draw.text(
         (36, list_top),
-        f"持仓 {len(rows)}",
+        f"持仓 {total}" + (f"（本页 {len(rows)}）" if pages > 1 else ""),
         font=_font(19, True),
         fill=TEXT,
         anchor="lm",
@@ -285,7 +308,7 @@ def render_position(
     for index, pos in enumerate(rows):
         y = list_top + 42 + index * 62
         draw.rounded_rectangle((24, y, WIDTH - 24, y + 54), radius=14, fill=PANEL)
-        left = pos.get("label") or pos["code"]
+        left = _clean_text(pos.get("label")) or pos["code"]
         draw.text((42, y + 18), left, font=_font(19, True), fill=TEXT, anchor="lm")
         draw.text(
             (WIDTH - 42, y + 18),
@@ -336,7 +359,7 @@ def render_rank(
     draw.text((36, 52), "【本群资产排行】", font=_font(29, True), fill=TEXT, anchor="lm")
     draw.text(
         (36, 90),
-        f"第 {round_no} 轮 · {updated_at} · 共 {len(rows)} 人",
+        f"{updated_at} · 共 {len(rows)} 人",
         font=_font(16),
         fill=MUTED,
         anchor="lm",
@@ -347,8 +370,8 @@ def render_rank(
     head_y = top + 22
     draw.text((48, head_y), "排名", font=_font(15), fill=DIM, anchor="lm")
     draw.text((108, head_y), "昵称", font=_font(15), fill=DIM, anchor="lm")
-    draw.text((580, head_y), "总资产", font=_font(15), fill=DIM, anchor="rm")
-    draw.text((716, head_y), "可用资金", font=_font(15), fill=DIM, anchor="rm")
+    draw.text((598, head_y), "总资产", font=_font(15), fill=DIM, anchor="rm")
+    draw.text((724, head_y), "可用", font=_font(15), fill=DIM, anchor="rm")
 
     for index, row in enumerate(rows):
         y = top + 44 + row_h // 2 + index * row_h
@@ -358,12 +381,12 @@ def render_rank(
             )
         color = ACCENT if index < 3 else MUTED
         draw.text((48, y), str(index + 1), font=_font(19, True), fill=color, anchor="lm")
-        name = str(row.get("name") or row.get("user") or "")
-        if len(name) > 9:
-            name = name[:8] + "…"
-        draw.text((108, y), name, font=_font(19), fill=TEXT, anchor="lm")
-        draw.text((580, y), _money(row["total"]), font=_font(20, True), fill=TEXT, anchor="rm")
-        draw.text((716, y), _money(row["cash"]), font=_font(17), fill=MUTED, anchor="rm")
+        name = _clean_text(row.get("name")) or str(row.get("user") or "")
+        if len(name) > 10:
+            name = name[:9] + "…"
+        draw.text((108, y), name, font=_font(18), fill=TEXT, anchor="lm")
+        draw.text((598, y), _money(row["total"]), font=_font(19, True), fill=TEXT, anchor="rm")
+        draw.text((724, y), _compact(row["cash"]), font=_font(15), fill=MUTED, anchor="rm")
 
     draw.text(
         (36, height - 26),
@@ -393,9 +416,9 @@ def render_profit(
     header_h = 118
     section_head = 44
     top = header_h + 12
-    gain_h = section_head + row_h * max(1, len(gainers)) + 14
+    gain_h = section_head + (row_h * len(gainers) if gainers else 44) + 14
     lose_top = top + gain_h + 18
-    lose_h = section_head + row_h * max(1, len(losers)) + 14
+    lose_h = section_head + (row_h * len(losers) if losers else 44) + 14
     bottom = lose_top + lose_h
     height = bottom + 54
     img, draw = _canvas(height)
@@ -403,7 +426,7 @@ def render_profit(
     draw.text((36, 52), "【本群盈亏榜】", font=_font(29, True), fill=TEXT, anchor="lm")
     draw.text(
         (36, 90),
-        f"第 {round_no} 轮 · {updated_at} · 只统计买卖盈亏",
+        f"{updated_at} · 只统计买卖盈亏",
         font=_font(16),
         fill=MUTED,
         anchor="lm",
@@ -431,7 +454,7 @@ def render_profit(
                     fill=PANEL_ALT,
                 )
             draw.text((48, y), str(index + 1), font=_font(19, True), fill=MUTED, anchor="lm")
-            name = str(row.get("name") or row.get("user") or "")
+            name = _clean_text(row.get("name")) or str(row.get("user") or "")
             if len(name) > 9:
                 name = name[:8] + "…"
             draw.text((96, y - 9), name, font=_font(18, True), fill=TEXT, anchor="lm")
@@ -468,6 +491,16 @@ def _money(cents: int) -> str:
     return f"{Decimal(int(cents)) / 100:,.2f}"
 
 
+def _compact(cents: int) -> str:
+    """可用资金列用亿/万缩写，避免大额把总资产列挤到一起。"""
+    value = Decimal(int(cents)) / 100
+    if abs(value) >= Decimal("100000000"):
+        return f"{value / Decimal('100000000'):.2f}亿"
+    if abs(value) >= Decimal("10000"):
+        return f"{value / Decimal('10000'):.2f}万"
+    return f"{value:,.2f}"
+
+
 def _signed_money(cents: int) -> str:
     value = Decimal(int(cents)) / 100
     return f"{value:+,.2f}"
@@ -488,7 +521,7 @@ def render_chart(stock: dict[str, Any], *, out: Path) -> Path:
     height = 468
     img, draw = _canvas(height)
 
-    name = stock.get("name") or stock["code"]
+    name = _clean_text(stock.get("name")) or stock["code"]
     draw.text((36, 52), f"【走势 {stock['code']}】", font=_font(28, True), fill=TEXT, anchor="lm")
     prev = history[0][1]
     pct = 0.0 if prev <= 0 else (history[-1][1] - prev) / prev * 100

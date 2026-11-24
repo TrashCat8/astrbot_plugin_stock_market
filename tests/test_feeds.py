@@ -267,6 +267,36 @@ def test_feed_keeps_last_frame_on_failure() -> None:
     assert feed.status == "stale", feed.status
 
 
+def test_first_quote_resets_placeholder_history() -> None:
+    """建账时用参考价画的那个假点，首次真实报价后必须清掉，否则区间会凭空多出高位。"""
+    stock = Instrument("SH600519", "贵州茅台", "stock", "tencent", "sh600519", ref_price=180.0)
+    cfg = Config(data_source="real", instruments=(stock,))
+    state = engine.new_state("g", 0, cfg)
+    assert state["stocks"]["SH600519"]["price"] == 18_000
+    quotes = {
+        "SH600519": feeds.Quote(
+            code="SH600519", symbol="sh600519", name="贵州茅台", last=1439.0,
+            prev_close=1485.75, open=1475.35, high=1478.0, low=1428.0,
+            currency="CNY", ts=1_700_000_000.0,
+        )
+    }
+    engine.advance(state, 300, cfg, quotes=quotes)
+    history = state["stocks"]["SH600519"]["history"]
+    assert len(history) == 1, history
+    assert history[0][1] == 143_900
+    assert state["stocks"]["SH600519"]["quote_ts"] > 0
+
+
+def test_full_quote_row_has_scale_and_text() -> None:
+    cfg = Config(data_source="real", instruments=(fx_instrument("JPY"),))
+    state = engine.new_state("g", 0, cfg)
+    rows, page, pages = engine.quote_page(state, 1, cfg, kind="fx")
+    row = rows[0]
+    assert row["price_scale"] == 1_000_000, row
+    assert row["digits"] == 6
+    assert row["price_text"].count(".") == 1
+
+
 def main() -> int:
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     failed = 0
