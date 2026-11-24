@@ -12,6 +12,13 @@ from typing import Any, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 
+try:  # 运行在 AstrBot 里；离线单测退回标准库日志
+    from astrbot.api import logger
+except Exception:  # pragma: no cover
+    import logging
+
+    logger = logging.getLogger("astrbot_plugin_stock_market")
+
 WIDTH = 760
 
 BG = (20, 21, 31)
@@ -25,16 +32,26 @@ GREEN = (64, 208, 148)
 ACCENT = (150, 130, 250)
 LINE = (58, 62, 84)
 
+_PLUGIN_ROOT = Path(__file__).resolve().parent.parent
+_BUNDLED_FONTS = _PLUGIN_ROOT / "assets" / "fonts"
+
+# 顺序：插件自带字体（任何环境都能出中文）→ 常见系统中文字体 → 兜底
 _FONT_CANDIDATES = [
+    (str(_BUNDLED_FONTS / "NotoSansSC-Regular.otf"), 0),
     ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
-    ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", 0),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
+    ("/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc", 0),
     ("C:/Windows/Fonts/msyh.ttc", 0),
     ("C:/Windows/Fonts/simhei.ttf", 0),
     ("/System/Library/Fonts/PingFang.ttc", 0),
     ("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf", 0),
 ]
 _BOLD_CANDIDATES = [
+    (str(_BUNDLED_FONTS / "NotoSansSC-Bold.otf"), 0),
     ("/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc", 0),
+    ("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc", 0),
+    ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc", 0),
     ("C:/Windows/Fonts/msyhbd.ttc", 0),
     ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc", 0),
     ("C:/Windows/Fonts/msyh.ttc", 0),
@@ -42,6 +59,7 @@ _BOLD_CANDIDATES = [
 ]
 
 _FONT_CACHE: dict[tuple[int, bool], Any] = {}
+_FONT_WARNED = False
 _ASSET_DIR: Path | None = None
 _BG_CACHE: dict[tuple[int, int], Image.Image | None] = {}
 
@@ -53,6 +71,7 @@ def set_asset_dir(path: Path | None) -> None:
 
 
 def _font(size: int, bold: bool = False) -> Any:
+    global _FONT_WARNED
     key = (size, bold)
     cached = _FONT_CACHE.get(key)
     if cached is not None:
@@ -66,6 +85,12 @@ def _font(size: int, bold: bool = False) -> Any:
             return font
         except OSError:
             continue
+    if not _FONT_WARNED:
+        _FONT_WARNED = True
+        logger.warning(
+            "[stock] 找不到中文字体，卡片上的中文会显示成方框；"
+            "请保留 assets/fonts 或安装 fonts-noto-cjk / fonts-wqy-zenhei。"
+        )
     font = ImageFont.load_default(size)
     _FONT_CACHE[key] = font
     return font
