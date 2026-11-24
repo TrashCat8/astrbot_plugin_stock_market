@@ -33,6 +33,7 @@ PLUGIN_NAME = "astrbot_plugin_stock_market"
 
 # 消息按钮要求 AstrBot >= 4.29.4；老版本自动退回纯文字
 HAS_BUTTON_ACTION = hasattr(filter, "button_action")
+HAS_LLM_TOOL = hasattr(filter, "llm_tool")
 
 ALIASES = {
     "开户": "open",
@@ -1625,3 +1626,436 @@ class StockMarketPlugin(Star):
                 )
             lines.append(tail + f"。管理员也可用「/股市 复牌 {stock['code']}」提前恢复。")
         return "\n".join(lines)
+
+# ------------------------------------------------------------------ #
+    # LLM 工具：让群友用自然语言玩股市
+    # 需要 AstrBot >= 4.9.2（filter.llm_tool）；工具返回纯文本，由模型转述
+    # ------------------------------------------------------------------ #
+
+    if HAS_LLM_TOOL:
+
+        @filter.llm_tool(name="stock_market")
+        async def llm_market(
+            self,
+            event: AstrMessageEvent,
+            market: str = "stock",
+            keyword: str = "",
+            page: int = 1,
+        ):
+            '''查看群内股市行情，返回现价与当日涨跌幅。用户问"茅台多少钱""汇率多少""看看行情"时使用。
+
+            Args:
+                market(string): stock=股票，fx=外汇，all=全部
+                keyword(string): 品种代码或名称，例如 SH600519、FX_USDCNY、茅台；留空返回行情列表
+                page(number): 列表页码，从 1 开始
+            '''
+            cfg = self._cfg()
+            namespace = self._namespace(event)
+            if not self._allowed(event, cfg):
+                return "本群未启用股市插件。"
+            try:
+                async with self._session(namespace, cfg) as state:
+                    state = self._require(state)
+                    engine.require_account(state, self._user(event))
+                    if keyword.strip():
+                        stock = engine.find_stock(state, keyword.strip())
+                        return self._detail_text(stock, cfg, int(state["round"]))
+                    kind = {"fx": "fx", "all": None}.get(market.strip().lower(), "stock")
+                    try:
+                        page_no = max(1, int(page))
+                    except (TypeError, ValueError):
+                        page_no = 1
+                    rows, cur, pages = engine.quote_page(state, page_no, cfg, kind=kind)
+                    if not rows:
+                        return "没有可显示的品种。"
+                    title = {"fx": "外汇", "stock": "股票"}.get(kind or "", "全部品种")
+                    lines = [f"{title}行情 第 {cur}/{pages} 页（金额单位：元）"]
+                    for row in rows:
+                        unit = "单位" if row.get("kind") == "fx" else "股"
+                        lines.append(
+                            f"{row['code']} {row.get('name') or ''} "
+                            f"现价 {row['price_text']} 元/{unit}，当日 {row['pct']:+.2f}%"
+                        )
+                    return "\n".join(lines)
+            except MarketError as exc:
+                return f"查询失败：{exc}"
+
+        @filter.llm_tool(name="stock_account")
+        async def llm_account(self, event: AstrMessageEvent, view: str = "overview"):
+            '''查看当前用户在群内股市的账户：持仓、盈亏、杠杆、挂单、成交。用户问"我赚了多少""我持仓什么"时使用。
+
+            Args:
+                view(string): overview=账户概览与持仓，leverage=杠杆欠款与强平价，orders=挂单，trades=最近成交
+            '''
+            cfg = self._cfg()
+            namespace = self._namespace(event)
+            user = self._user(event)
+            if not self._allowed(event, cfg):
+                return "本群未启用股市插件。"
+            view_key = (view or "overview").strip().lower()
+            try:
+                async with self._session(namespace, cfg) as state:
+                    state = self._require(state)
+                    acc = engine.require_account(state, user)
+                    self._mark_name(event, state, user)
+                    if view_key == "leverage":
+                        info = engine.leverage_info(state, user, cfg)
+                        lines = [
+                            f"可用 {engine.fmt_money(info['cash'])} 元，总资产 "
+                            f"{engine.fmt_money(info['total'])} 元，欠款 "
+                            f"{engine.fmt_money(info['debt'])} 元，净资产 "
+                            f"{engine.fmt_money(info['net'])} 元",
+                            f"最高 {info['max_leverage']:g} 倍，日息 "
+                            f"{info['daily_rate'] * 100:.3f}%，权益/市值低于 "
+                            f"{info['call_ratio'] * 100:.0f}% 自动强平",
+                        ]
+                        for row in info["positions"]:
+                            lines.append(
+                                f"{row['label']} {row['shares']} {row['unit']}，"
+                                f"现价 {row['price_text']}，市值 "
+                                f"{engine.fmt_money(row['value'])} 元，权益比 "
+                                f"{row['ratio']:.1f}%，强平价 {row['liq_price_text']}"
+                            )
+                        if not info["positions"]:
+                            lines.append("当前没有杠杆持仓。")
+                        return "\n".join(lines)
+
+                    if view_key == "orders":
+                        orders = sorted(
+                            (o for o in state.get("orders", {}).values() if o["user"] == user),
+                            key=lambda o: int(o["id"]),
+                        )
+                        if not orders:
+                            return "当前没有挂单。"
+                        lines = [f"共 {len(orders)} 笔挂单："]
+                        for order in orders:
+                            stock = state["stocks"].get(order["code"]) or {"code": order["code"]}
+                            side = "买入" if order["side"] == "buy" else "卖出"
+                            lines.append(
+                                f"#{order['id']} {side} {order['code']} "
+                                f"{order['shares']} {engine.unit_label(stock)}，限价 "
+                                f"{engine.fmt_price(stock, int(order['limit']))} 元"
+                            )
+                        return "\n".join(lines)
+
+                    if view_key == "trades":
+                        trades = [t for t in state.get("trades", []) if t["user"] == user][-8:]
+                        if not trades:
+                            return "还没有成交记录。"
+                        lines = ["最近成交："]
+                        for trade in reversed(trades):
+                            stock = state["stocks"].get(trade["code"]) or {"code": trade["code"]}
+                            side = "买入" if trade["side"] == "buy" else "卖出"
+                            lines.append(
+                                f"{engine.fmt_time(trade['ts'])} {side} {trade['code']} "
+                                f"{trade['shares']} {engine.unit_label(stock)} @ "
+                                f"{engine.fmt_price(stock, int(trade['price']))} 元"
+                            )
+                        return "\n".join(lines)
+
+                    summary = engine.account_summary(state, user)
+                    lines = [
+                        f"可用 {engine.fmt_money(summary['cash'])} 元，冻结 "
+                        f"{engine.fmt_money(summary['frozen'])} 元，持仓市值 "
+                        f"{engine.fmt_money(summary['market_value'])} 元",
+                        f"总资产 {engine.fmt_money(summary['total'])} 元，杠杆欠款 "
+                        f"{engine.fmt_money(summary['debt'])} 元，净资产 "
+                        f"{engine.fmt_money(summary['net'])} 元",
+                        f"已实现盈亏 {engine.fmt_money(summary['realized'])} 元，"
+                        f"浮动盈亏 {engine.fmt_money(summary['floating'])} 元",
+                    ]
+                    if not summary["positions"]:
+                        lines.append("当前空仓。")
+                    for pos in summary["positions"]:
+                        lines.append(
+                            f"{pos.get('label') or pos['code']} {pos['shares']} "
+                            f"{pos.get('unit') or '股'}，现价 {pos.get('price_text')}，"
+                            f"市值 {engine.fmt_money(pos['value'])} 元，浮动 "
+                            f"{engine.fmt_money(pos['floating'])} 元"
+                        )
+                    return "\n".join(lines)
+            except MarketError as exc:
+                return f"查询失败：{exc}"
+
+        @filter.llm_tool(name="stock_trade")
+        async def llm_trade(
+            self,
+            event: AstrMessageEvent,
+            action: str = "buy",
+            code: str = "",
+            shares: int = 0,
+            price: float = 0.0,
+            leverage: float = 2.0,
+        ):
+            '''在群内股市下单：市价买卖、限价挂单、融资买入。用户说"买100股茅台""挂个1400的买单"时使用。
+
+            Args:
+                action(string): buy=市价买入，sell=市价卖出，limitbuy=限价买入，limitsell=限价卖出，margin=融资买入
+                code(string): 品种代码，例如 SH600519、FX_USDCNY
+                shares(number): 数量（股票按股，外汇按单位）
+                price(number): 限价单价格，仅 limitbuy/limitsell 需要
+                leverage(number): 融资倍数，仅 margin 需要
+            '''
+            cfg = self._cfg()
+            namespace = self._namespace(event)
+            user = self._user(event)
+            if not self._allowed(event, cfg):
+                return "本群未启用股市插件。"
+            act = (action or "buy").strip().lower()
+            if act not in ("buy", "sell", "limitbuy", "limitsell", "margin"):
+                return "action 只能是 buy / sell / limitbuy / limitsell / margin。"
+            if not str(code).strip():
+                return "缺少品种代码，例如 SH600519、FX_USDCNY。"
+            try:
+                share_text = str(int(shares))
+            except (TypeError, ValueError):
+                return "shares 必须是正整数。"
+            try:
+                async with self._session(namespace, cfg) as state:
+                    state = self._require(state)
+                    engine.require_account(state, user)
+                    self._mark_name(event, state, user)
+                    if act in ("buy", "sell"):
+                        trade = (
+                            engine.buy(state, user, code, share_text, cfg)
+                            if act == "buy"
+                            else engine.sell(state, user, code, share_text, cfg)
+                        )
+                        side = "买入" if act == "buy" else "卖出"
+                        lines = [
+                            f"{side}成功：{trade['label']} × {trade['shares']} {trade['unit']}，"
+                            f"成交价 {trade['price_text']} 元/{trade['unit']}"
+                        ]
+                        if act == "buy":
+                            lines.append(
+                                f"手续费 {engine.fmt_money(trade['fee'])} 元，"
+                                f"可用资金 {engine.fmt_money(trade['cash'])} 元"
+                            )
+                        else:
+                            lines.append(
+                                f"手续费 {engine.fmt_money(trade['fee'])} 元，到账 "
+                                f"{engine.fmt_money(trade['proceeds'])} 元，本次盈亏 "
+                                f"{engine.fmt_money(trade['realized'])} 元，可用资金 "
+                                f"{engine.fmt_money(trade['cash'])} 元"
+                            )
+                        return "\n".join(lines)
+
+                    if act in ("limitbuy", "limitsell"):
+                        if price <= 0:
+                            return "限价单需要传 price。"
+                        result = engine.place_order(
+                            state,
+                            user,
+                            "buy" if act == "limitbuy" else "sell",
+                            code,
+                            share_text,
+                            price,
+                            cfg,
+                        )
+                        stock = result["stock"]
+                        order = result["order"]
+                        if result["executed_at"]:
+                            return (
+                                f"限价单已立即成交：{engine.display_label(stock)} "
+                                f"{order['shares']} {engine.unit_label(stock)}，成交价 "
+                                f"{engine.fmt_price(stock, int(result['executed_at']))} 元"
+                            )
+                        return (
+                            f"已挂单 #{order['id']}：{engine.display_label(stock)} "
+                            f"{order['shares']} {engine.unit_label(stock)}，限价 "
+                            f"{engine.fmt_price(stock, int(order['limit']))} 元，"
+                            f"{cfg.order_ttl_hours} 小时未成交自动撤销"
+                        )
+
+                    trade = engine.leverage_buy(state, user, code, share_text, leverage, cfg)
+                    return (
+                        f"融资买入成功：{trade['label']} × {trade['shares']} "
+                        f"{trade['unit']}（{trade['leverage']:g} 倍），成交价 "
+                        f"{trade['price_text']} 元，保证金 "
+                        f"{engine.fmt_money(trade['margin'])} 元，系统垫付 "
+                        f"{engine.fmt_money(trade['borrowed'])} 元，当前欠款 "
+                        f"{engine.fmt_money(trade['debt'])} 元"
+                    )
+            except MarketError as exc:
+                return f"下单失败：{exc}"
+
+        @filter.llm_tool(name="stock_repay")
+        async def llm_repay(self, event: AstrMessageEvent, amount: float = 0.0):
+            '''偿还融资欠款。用户说"还债""把欠的钱还上"时使用。
+
+            Args:
+                amount(number): 还款金额（元），传 0 表示能还多少还多少
+            '''
+            cfg = self._cfg()
+            namespace = self._namespace(event)
+            user = self._user(event)
+            if not self._allowed(event, cfg):
+                return "本群未启用股市插件。"
+            try:
+                async with self._session(namespace, cfg) as state:
+                    state = self._require(state)
+                    self._mark_name(event, state, user)
+                    text = "" if amount <= 0 else str(amount)
+                    info = engine.repay_debt(state, user, text, cfg)
+                    return (
+                        f"已还债 {engine.fmt_money(info['amount'])} 元，剩余欠款 "
+                        f"{engine.fmt_money(info['debt'])} 元，可用资金 "
+                        f"{engine.fmt_money(info['cash'])} 元"
+                    )
+            except MarketError as exc:
+                return f"还债失败：{exc}"
+
+        @filter.llm_tool(name="stock_play")
+        async def llm_play(
+            self,
+            event: AstrMessageEvent,
+            action: str = "checkin",
+            amount: float = 0.0,
+            target: str = "",
+        ):
+            '''群内股市的玩法：签到、补助、排行、盈亏、异动新闻、赌博、抢劫、转账。
+
+            Args:
+                action(string): checkin=签到，relief=领补助，rank=资产排行，profit=盈亏榜，news=异动新闻，gamble=赌博，rob=抢别人现金，transfer=转账给别人
+                amount(number): gamble 的下注金额、transfer 的转账金额（元）
+                target(string): rob/transfer 的目标 QQ 号
+            '''
+            cfg = self._cfg()
+            namespace = self._namespace(event)
+            user = self._user(event)
+            if not self._allowed(event, cfg):
+                return "本群未启用股市插件。"
+            act = (action or "checkin").strip().lower()
+            try:
+                async with self._session(namespace, cfg) as state:
+                    state = self._require(state)
+                    engine.require_account(state, user)
+                    self._mark_name(event, state, user)
+                    if act == "checkin":
+                        info = engine.checkin(state, user, cfg)
+                        return (
+                            f"签到成功，获得 {engine.fmt_money(info['amount'])} 元，"
+                            f"连续 {info['streak']} 天，可用资金 "
+                            f"{engine.fmt_money(info['cash'])} 元"
+                        )
+                    if act == "relief":
+                        info = engine.relief(state, user, cfg)
+                        return (
+                            f"补助到账 {engine.fmt_money(info['amount'])} 元，"
+                            f"可用资金 {engine.fmt_money(info['cash'])} 元"
+                        )
+                    if act == "rank":
+                        rows = engine.rank(state, cfg, cfg.rank_size)
+                        lines = [f"资产排行（共 {len(rows)} 人）："]
+                        for index, row in enumerate(rows):
+                            lines.append(
+                                f"{index + 1}. {row['name']} 净资产 "
+                                f"{engine.fmt_money(row['total'])} 元"
+                            )
+                        return "\n".join(lines)
+                    if act == "profit":
+                        data = engine.profit_rank(state, cfg, cfg.rank_size)
+                        lines = ["赚钱榜："]
+                        lines += [
+                            f"{i + 1}. {row['name']} {engine.fmt_money(row['total'])} 元"
+                            for i, row in enumerate(data["gainers"])
+                        ] or ["暂无"]
+                        lines.append("亏钱榜：")
+                        lines += [
+                            f"{i + 1}. {row['name']} {engine.fmt_money(row['total'])} 元"
+                            for i, row in enumerate(data["losers"])
+                        ] or ["暂无"]
+                        return "\n".join(lines)
+                    if act == "news":
+                        news = state.get("news", [])[-5:]
+                        if not news:
+                            return "暂无市场异动。"
+                        return "\n".join(
+                            f"{engine.fmt_time(item['ts'])} {item['text']}" for item in reversed(news)
+                        )
+                    if act == "gamble":
+                        info = engine.gamble(state, user, str(amount), cfg)
+                        return (
+                            f"下注 {engine.fmt_money(info['bet'])} 元，开奖 "
+                            f"{engine.fmt_money(info['payout'])} 元，净变化 "
+                            f"{engine.fmt_money(info['net'])} 元，可用资金 "
+                            f"{engine.fmt_money(info['cash'])} 元"
+                        )
+                    if act == "rob":
+                        if not target.strip():
+                            return "抢劫需要 target（对方 QQ 号）。"
+                        info = engine.rob(state, user, target.strip(), cfg)
+                        if info["success"]:
+                            return (
+                                f"抢到 {engine.fmt_money(info['amount'])} 元，"
+                                f"成功率 {info['chance']:.0f}%，可用资金 "
+                                f"{engine.fmt_money(info['cash'])} 元"
+                            )
+                        return (
+                            f"抢劫失败，被反抢 {engine.fmt_money(info['amount'])} 元，"
+                            f"可用资金 {engine.fmt_money(info['cash'])} 元"
+                        )
+                    if act == "transfer":
+                        if not target.strip():
+                            return "转账需要 target（对方 QQ 号）。"
+                        if amount <= 0:
+                            return "转账需要 amount（金额，元）。"
+                        info = engine.transfer(state, user, target.strip(), str(amount), cfg)
+                        return (
+                            f"已转 {engine.fmt_money(info['amount'])} 元给 "
+                            f"{info['target_name']}，你的可用资金 "
+                            f"{engine.fmt_money(info['cash'])} 元"
+                        )
+                    return "action 不在支持范围。"
+            except MarketError as exc:
+                return f"操作失败：{exc}"
+
+        @filter.llm_tool(name="stock_chart")
+        async def llm_chart(self, event: AstrMessageEvent, code: str = ""):
+            '''查看某个品种的走势摘要（区间高低、涨跌幅、数据点）。
+
+            Args:
+                code(string): 品种代码，例如 SH600519、FX_USDCNY
+            '''
+            cfg = self._cfg()
+            namespace = self._namespace(event)
+            if not self._allowed(event, cfg):
+                return "本群未启用股市插件。"
+            if not str(code).strip():
+                return "需要传 code，例如 SH600519。"
+            try:
+                async with self._session(namespace, cfg) as state:
+                    state = self._require(state)
+                    engine.require_account(state, self._user(event))
+                    stock = engine.find_stock(state, str(code).strip())
+                    snapshot = {
+                        "code": stock["code"],
+                        "name": stock.get("name") or "",
+                        "kind": stock.get("kind") or "stock",
+                        "price": int(stock["price"]),
+                        "price_scale": engine.price_scale(stock),
+                        "price_digits": engine.price_digits(stock),
+                        "prev": int(stock.get("prev") or stock["price"]),
+                        "history": [list(item) for item in stock.get("history", [])],
+                    }
+                    return textfmt.chart_text(snapshot)
+            except MarketError as exc:
+                return f"查询失败：{exc}"
+
+        @filter.llm_tool(name="stock_help")
+        async def llm_help(self, event: AstrMessageEvent):
+            '''列出群内股市玩法的简要说明（指令、规则、手续费、杠杆）。用户问"怎么玩""有哪些功能"时使用。'''
+            cfg = self._cfg()
+            return (
+                "群内股市（虚拟资金，真实行情）：\n"
+                "/股市 开户 · 行情 [页码] · 汇市 · 持仓 [页码]\n"
+                "/股市 买入 代码 数量 · 卖出 代码 数量 · 走势 代码\n"
+                "/股市 融资买入 代码 数量 倍数 · 杠杆 · 还债\n"
+                "/股市 买单/卖单 代码 数量 价格 · 挂单 · 撤单 编号 · 成交\n"
+                "/股市 新闻 · 排行 · 盈亏 · 签到 · 补助\n"
+                "/股市 db 金额 · 抢劫 @对方 · transfer @对方 金额\n"
+                f"手续费 {cfg.fee_rate * 100:.3f}%，杠杆最高 {cfg.max_leverage:g} 倍，"
+                f"欠款日息 {cfg.margin_daily_rate * 100:.3f}%，"
+                f"权益/市值低于 {cfg.margin_call_ratio * 100:.0f}% 自动强平。"
+                "真实行情模式下不设退市；净值清零会在群里播报。"
+            )

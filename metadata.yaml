@@ -9,13 +9,14 @@ desc: |
   支持倍数开仓的杠杆玩法（保证金、按日计息、自动强平与欠款自动偿还）。
   真实行情下单日涨跌超过阈值会生成「行情异动」新闻；也可切回 simulated 本地模拟行情离线使用。
   行情 / 持仓 / 帮助卡片附可点击按钮，QQ 官方机器人还会在正文附带可点指令链（需 AstrBot >= 4.29.4，老版本自动跳过）。
+  向 agent 注册 7 个 LLM 工具，可直接用自然语言查行情、买卖、签到、看盈亏。
   另有签到、补助、资产排行、赚钱榜/亏钱榜，以及 db 赌博、抢劫、transfer 转账等玩法；
   资产清零时群内播报「空中飞人」。
   卡片由 Pillow 本地渲染，不依赖外部文转图服务。
   本插件为 AI 辅助创作（由 Claude 协助编写、作者验收），详见仓库 README 的「AI 辅助创作说明」。
 author: TrashCat8
 repo: https://github.com/TrashCat8/astrbot_plugin_stock_market
-version: 1.8.2
+version: 1.8.3
 astrbot_version: ">=4.9.2"
 support_platforms:
   - aiocqhttp
