@@ -126,9 +126,9 @@ async def main() -> int:
     def check(name: str, result, expect_type: str = "text") -> dict:
         items = list(result) if isinstance(result, (list, tuple)) else [result]
         first = items[0]
-        ok = first.get("type") == expect or (
-            expect == "text" and first.get("type") == "chain"
-        )_type
+        ok = first.get("type") == expect_type or (
+            expect_type == "text" and first.get("type") == "chain"
+        )
         if expect_type == "image":
             ok = ok and first.get("size", 0) > 1000
         body = first.get("text") or "".join(
@@ -171,7 +171,7 @@ async def main() -> int:
 
         handlers = {
             name: hasattr(plugin, name)
-            for name in ("button_quote", "button_fx", "button_position", "button_help")
+            for name in ("on_stock_button", "_route_button", "_panel")
         }
         print(("OK   " if all(handlers.values()) else "FAIL ") + f"按钮回调注册: {handlers}")
         if not all(handlers.values()):

@@ -311,12 +311,12 @@ class StockMarketPlugin(Star):
         event: AstrMessageEvent,
         cfg: Config,
         result,
-        buttons=(),
+        rows=(),
         links=(),
     ):
-        """给结果挂按钮/文字链。
+        """给指令结果挂按钮行/文字链。
 
-        按钮点击本身产生的新消息不再挂按钮，避免「点一次长一条」；
+        按钮点击本身产生的新消息不再挂按钮（面板走 `_panel`），避免「点一次长一条」；
         QQ 官方对交互事件的回复只接受文字，因此按钮事件下的卡片命令统一走文字分支。
         """
         if result is None or self._is_button_event(event):
@@ -324,13 +324,13 @@ class StockMarketPlugin(Star):
         if not interactive.available():
             return result
 
-        row = (
-            interactive.button_row(buttons, "快捷操作")
-            if cfg.interactive_buttons and buttons
-            else None
+        action_rows = (
+            interactive.button_rows(rows, "快捷操作")
+            if cfg.interactive_buttons and rows
+            else []
         )
         want_links = bool(cfg.text_chain and links and self._is_qq_official(event))
-        if row is None and not want_links:
+        if not action_rows and not want_links:
             return result
 
         items = list(result) if isinstance(result, (list, tuple)) else [result]
@@ -342,15 +342,25 @@ class StockMarketPlugin(Star):
                 # 平台文本长度有限，超长正文先保消息本身，按钮/链一律不加
                 return result
             text = interactive.with_links(plain, links) if want_links else plain
-            chain = [interactive.Plain(text)]
-            if row is not None:
-                chain.append(row)
+            chain = [interactive.Plain(text), *action_rows]
             return [*head, event.chain_result(chain)]
 
         # 图片等非文字结果：按钮单独发一条，避免平台拒绝「媒体 + keyboard」
-        if row is None:
+        if not action_rows:
             return result
-        return [*items, event.chain_result([interactive.Plain("快捷操作"), row])]
+        return [*items, event.chain_result([interactive.Plain("快捷操作"), *action_rows])]
+
+    def _panel(self, event: AstrMessageEvent, cfg: Config, text: str, rows, links=()):
+        """下钻面板：按钮事件里也要带按钮，所以不走 `_interactive` 的抑制逻辑。"""
+        body = (
+            interactive.with_links(text, links)
+            if cfg.text_chain and links and self._is_qq_official(event)
+            else text
+        )
+        chain: list[Any] = [interactive.Plain(body)]
+        if cfg.interactive_buttons and rows:
+            chain.extend(interactive.button_rows(rows, "快捷操作"))
+        return event.chain_result(chain)
 
     # ------------------------------------------------------------------ #
     # 指令入口
@@ -428,12 +438,18 @@ class StockMarketPlugin(Star):
             if arg and not arg.isdigit():
                 stock = engine.find_stock(state, arg)
                 detail = self._detail_text(stock, cfg, int(state["round"]))
+                specs = [
+                    {**spec, "data": {"code": stock["code"]}}
+                    for spec in interactive.STOCK_BUTTONS
+                ]
                 return self._interactive(
                     event,
                     cfg,
                     event.plain_result(detail),
-                    () if text_only else interactive.QUOTE_BUTTONS,
-                    interactive.QUOTE_LINKS,
+                    () if text_only else [specs],
+                    interactive.stock_links(
+                        stock["code"], engine.fmt_price(stock, int(stock["price"]))
+                    ),
                 )
 
             page_no = int(arg) if arg.isdigit() else 1
@@ -466,8 +482,8 @@ class StockMarketPlugin(Star):
                 event,
                 cfg,
                 event.plain_result(text),
-                () if text_only else interactive.QUOTE_BUTTONS,
-                interactive.QUOTE_LINKS,
+                () if text_only else [interactive.NAV_BUTTONS],
+                interactive.HELP_LINKS,
             )
         try:
             render.render_quote(
@@ -488,15 +504,15 @@ class StockMarketPlugin(Star):
                 event,
                 cfg,
                 event.plain_result(text),
-                interactive.QUOTE_BUTTONS,
-                interactive.QUOTE_LINKS,
+                [interactive.NAV_BUTTONS],
+                interactive.HELP_LINKS,
             )
         return self._interactive(
             event,
             cfg,
             event.image_result(str(out)),
-            interactive.QUOTE_BUTTONS,
-            interactive.QUOTE_LINKS,
+            [interactive.NAV_BUTTONS],
+            interactive.HELP_LINKS,
         )
 
     async def _cmd_fx(self, event, namespace, cfg, rest):
@@ -515,7 +531,7 @@ class StockMarketPlugin(Star):
 
             # 持仓可能很多（17 个品种全买），按 page_size 分页，避免一张卡长到看不清；
             # 持仓行高比行情行高，单页再压到最多 6 行
-            size = max(1, min(6, cfg.page_size))
+            size = max(1, min(5, cfg.page_size))
             all_rows = summary["positions"]
             total = len(all_rows)
             pages = max(1, math.ceil(total / size))
@@ -534,8 +550,8 @@ class StockMarketPlugin(Star):
                 event,
                 cfg,
                 self._with_notes(event, notes, event.plain_result(text)),
-                () if text_only else interactive.POSITION_BUTTONS,
-                interactive.POSITION_LINKS,
+                () if text_only else interactive.holding_rows(view["positions"]),
+                interactive.SELL_LINKS,
             )
         try:
             render.render_position(
@@ -553,15 +569,15 @@ class StockMarketPlugin(Star):
                 event,
                 cfg,
                 self._with_notes(event, notes, event.plain_result(text)),
-                interactive.POSITION_BUTTONS,
-                interactive.POSITION_LINKS,
+                interactive.holding_rows(view["positions"]),
+                interactive.SELL_LINKS,
             )
         return self._interactive(
             event,
             cfg,
             self._with_notes(event, notes, event.image_result(str(out))),
-            interactive.POSITION_BUTTONS,
-            interactive.POSITION_LINKS,
+            interactive.holding_rows(view["positions"]),
+            interactive.SELL_LINKS,
         )
 
     async def _cmd_buy(self, event, namespace, cfg, rest):
@@ -1104,7 +1120,7 @@ class StockMarketPlugin(Star):
                 event,
                 cfg,
                 event.plain_result(textfmt.help_text(cfg)),
-                () if text_only else interactive.HELP_BUTTONS,
+                () if text_only else [interactive.NAV_BUTTONS],
                 interactive.HELP_LINKS,
             )
         out = self.store.cache_file("help.png")
@@ -1129,14 +1145,14 @@ class StockMarketPlugin(Star):
                 event,
                 cfg,
                 event.plain_result(textfmt.help_text(cfg)),
-                interactive.HELP_BUTTONS,
+                [interactive.NAV_BUTTONS],
                 interactive.HELP_LINKS,
             )
         return self._interactive(
             event,
             cfg,
             event.image_result(str(out)),
-            interactive.HELP_BUTTONS,
+            [interactive.NAV_BUTTONS],
             interactive.HELP_LINKS,
         )
 
@@ -1147,50 +1163,232 @@ class StockMarketPlugin(Star):
 
     if HAS_BUTTON_ACTION and interactive.available():
 
-        @filter.button_action("stock:quote")
-        async def button_quote(self, event: AstrMessageEvent):
-            async for result in self.market(event, "行情"):
+        @filter.button_action()
+        async def on_stock_button(self, event: AstrMessageEvent):
+            """所有 stock:* 按钮的统一入口：按 action_id 分发，非本插件的按钮直接忽略。"""
+            async for result in self._route_button(event):
                 yield result
 
-        @filter.button_action("stock:fx")
-        async def button_fx(self, event: AstrMessageEvent):
-            async for result in self.market(event, "汇市"):
-                yield result
+    async def _route_button(self, event: AstrMessageEvent):
+        getter = getattr(event, "get_button_interaction", None)
+        interaction = getter() if callable(getter) else None
+        if interaction is None:
+            return
+        action = str(getattr(interaction, "action_id", "") or "")
+        if not action.startswith("stock:"):
+            return
+        data = getattr(interaction, "data", None)
+        data = data if isinstance(data, dict) else {}
+        cfg = self._cfg()
+        if not self._allowed(event, cfg):
+            return
+        act = action.split(":", 1)[1]
+        namespace = self._namespace(event)
+        user = self._user(event)
 
-        @filter.button_action("stock:position")
-        async def button_position(self, event: AstrMessageEvent):
-            async for result in self.market(event, "持仓"):
+        # 直接对应指令的按钮
+        direct = {
+            "quote": "行情",
+            "fx": "汇市",
+            "position": "持仓",
+            "checkin": "签到",
+            "rank": "排行",
+            "profit": "盈亏",
+            "relief": "补助",
+            "news": "新闻",
+            "help": "帮助",
+            "orders": "挂单",
+            "trades": "成交",
+            "leverage": "杠杆",
+        }
+        if act in direct:
+            async for result in self.market(event, direct[act]):
                 yield result
+            return
 
-        @filter.button_action("stock:checkin")
-        async def button_checkin(self, event: AstrMessageEvent):
-            async for result in self.market(event, "签到"):
-                yield result
+        if act == "home":
+            yield self._panel(
+                event,
+                cfg,
+                "【快捷面板】点按钮进入对应功能；需要填数量的操作，点下面的指令链改参数。",
+                [interactive.NAV_BUTTONS],
+            )
+            return
 
-        @filter.button_action("stock:rank")
-        async def button_rank(self, event: AstrMessageEvent):
-            async for result in self.market(event, "排行"):
-                yield result
+        if act == "trade":
+            yield self._panel(
+                event,
+                cfg,
+                "【交易】按钮只负责翻页，不直接下单。\n"
+                "点下面指令链 → 把数量和价格改成你的 → 发送。",
+                [interactive.TRADE_ROWS[0], interactive.TRADE_ROWS[1]],
+                interactive.BUY_LINKS,
+            )
+            return
 
-        @filter.button_action("stock:profit")
-        async def button_profit(self, event: AstrMessageEvent):
-            async for result in self.market(event, "盈亏"):
-                yield result
+        if act == "play":
+            yield self._panel(
+                event,
+                cfg,
+                "【玩法】签到 / 补助 / 排行 / 盈亏点按钮直接执行；\n"
+                "db、抢劫、转账要填金额或对象，点指令链补上。",
+                [interactive.PLAY_ROWS[0], interactive.PLAY_ROWS[1]],
+                interactive.PLAY_LINKS,
+            )
+            return
 
-        @filter.button_action("stock:relief")
-        async def button_relief(self, event: AstrMessageEvent):
-            async for result in self.market(event, "补助"):
-                yield result
+        if act in ("buy", "sell"):
+            if act == "sell":
+                links = await self._position_links(namespace, cfg, user)
+                text = "【卖出】下面是你的持仓，点指令链确认数量后发送。"
+            else:
+                links = interactive.BUY_LINKS
+                text = "【买入】点指令链，把 100 改成你要的数量再发送。"
+            yield self._panel(event, cfg, text, [interactive.NAV_BUTTONS], links)
+            return
 
-        @filter.button_action("stock:news")
-        async def button_news(self, event: AstrMessageEvent):
-            async for result in self.market(event, "新闻"):
-                yield result
+        if act in ("limitbuy", "limitsell"):
+            yield self._panel(
+                event,
+                cfg,
+                "【限价单】点指令链后把价格改成你的目标价；达到限价按当时更优价成交。",
+                [interactive.NAV_BUTTONS],
+                interactive.LIMIT_LINKS,
+            )
+            return
 
-        @filter.button_action("stock:help")
-        async def button_help(self, event: AstrMessageEvent):
-            async for result in self.market(event, "帮助"):
+        if act in ("margin", "repay", "dice", "rob", "transfer"):
+            text = {
+                "margin": "【融资】用法：/股市 融资买入 代码 数量 倍数，例如 SH600519 100 2",
+                "repay": "【还债】点指令链，或直接发送 /股市 还债。",
+                "dice": "【db】点指令链把 1000 改成你的下注金额。",
+                "rob": "【抢劫】点指令链，在空格后 @ 对方或填 QQ 号。",
+                "transfer": "【转账】点指令链，补上 @对方 和金额。",
+            }[act]
+            links = interactive.PLAY_LINKS
+            if act == "margin":
+                links = (("/股市 融资买入 SH600519 100 2", "融资买茅台"),)
+            yield self._panel(event, cfg, text, [interactive.NAV_BUTTONS], links)
+            return
+
+        if act == "chart":
+            code = str(data.get("code") or "")
+            if code:
+                async for result in self.market(event, f"走势 {code}"):
+                    yield result
+            else:
+                yield self._panel(
+                    event,
+                    cfg,
+                    "先查详情再点走势，或发送 /股市 走势 代码。",
+                    [interactive.NAV_BUTTONS],
+                )
+            return
+
+        if act.startswith("ask_sell"):
+            async for result in self._ask_sell(event, cfg, namespace, user):
                 yield result
+            return
+
+        if act == "confirm_sell":
+            async for result in self._do_sell(event, cfg, namespace, user, data):
+                yield result
+            return
+
+        if act == "cancel":
+            yield event.plain_result("已取消。")
+            return
+
+    async def _position_links(self, event, namespace, cfg, user):
+        """把用户当前持仓做成卖出指令链（最多 5 条）。"""
+        links: list[tuple[str, str]] = []
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            acc = engine.require_account(state, user)
+            for code, pos in (acc.get("positions") or {}).items():
+                shares = int(pos.get("shares", 0))
+                if shares <= 0:
+                    continue
+                stock = state["stocks"].get(code)
+                name = engine.display_name(stock) if stock else code
+                links.append((f"/股市 卖出 {code} {shares}", f"卖{name[:4]}"))
+        return tuple(links[:5]) or interactive.SELL_LINKS
+
+    async def _ask_sell(self, event, cfg, namespace, user):
+        """持仓行的「卖①」按钮：先确认再成交。"""
+        getter = getattr(event, "get_button_interaction", None)
+        interaction = getter() if callable(getter) else None
+        data = getattr(interaction, "data", None) if interaction else None
+        code = str((data or {}).get("code") or "") if isinstance(data, dict) else ""
+        if not code:
+            yield event.plain_result("这个按钮没有带上持仓信息，请从持仓页重新点一次。")
+            return
+
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            stock = engine.find_stock(state, code)
+            acc = engine.require_account(state, user)
+            pos = engine.position_of(acc, stock["code"])
+            shares = int(pos["shares"]) if pos else 0
+            label = engine.display_label(stock)
+            unit = engine.unit_label(stock)
+            price_text = engine.fmt_price(stock, int(stock["price"]))
+
+        if shares <= 0:
+            yield event.plain_result("这个持仓已经不在了。")
+            return
+
+        rows = [
+            [
+                {
+                    "id": "stock:confirm_sell",
+                    "label": "确认卖出",
+                    "style": "danger",
+                    "data": {"code": code, "shares": shares},
+                },
+                {"id": "stock:cancel", "label": "取消"},
+            ]
+        ]
+        yield self._panel(
+            event,
+            cfg,
+            f"【确认卖出】{label} {shares} {unit}，按现价 {price_text} 元成交？",
+            rows,
+        )
+
+    async def _do_sell(self, event, cfg, namespace, user, data):
+        """二次确认后的市价卖出。"""
+        code = str(data.get("code") or "")
+        try:
+            shares = int(data.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0
+        if not code or shares <= 0:
+            yield event.plain_result("卖出参数不完整，请从持仓页重新点一次。")
+            return
+
+        try:
+            async with self._session(namespace, cfg) as state:
+                state = self._require(state)
+                self._mark_name(event, state, user)
+                trade = engine.sell(state, user, code, str(shares), cfg)
+                notes = engine.pop_notices(engine.require_account(state, user))
+        except MarketError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+
+        lines = [
+            *notes,
+            f"卖出成功：{trade['label']} × {trade['shares']} {trade['unit']}",
+            f"成交价 {trade['price_text']} 元/{trade['unit']}，"
+            f"手续费 {engine.fmt_money(trade['fee'])} 元",
+            f"到账 {engine.fmt_money(trade['proceeds'])} 元，"
+            f"本次盈亏 {engine.fmt_money(trade['realized'])} 元",
+        ]
+        if trade.get("repaid"):
+            lines.append(f"偿还欠款 {engine.fmt_money(trade['repaid'])} 元")
+        lines.append(f"可用资金: {engine.fmt_money(trade['cash'])} 元")
+        yield event.plain_result("\n".join(lines))
 
     # ------------------------------------------------------------------ #
 
