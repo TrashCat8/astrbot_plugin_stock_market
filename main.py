@@ -494,15 +494,11 @@ class StockMarketPlugin(Star):
             if arg and not arg.isdigit():
                 stock = engine.find_stock(state, arg)
                 detail = self._detail_text(stock, cfg, int(state["round"]))
-                specs = [
-                    {**spec, "data": {"code": stock["code"]}}
-                    for spec in interactive.STOCK_BUTTONS
-                ]
                 return self._interactive(
                     event,
                     cfg,
                     event.plain_result(detail),
-                    () if text_only else [specs],
+                    () if text_only else [interactive.stock_trade_row(stock["code"])],
                     interactive.stock_links(
                         stock["code"], engine.fmt_price(stock, int(stock["price"]))
                     ),
@@ -1294,13 +1290,25 @@ class StockMarketPlugin(Star):
             return
 
         if act in ("buy", "sell"):
-            if act == "sell":
-                links = await self._position_links(namespace, cfg, user)
-                text = "【卖出】下面是你的持仓，点指令链确认数量后发送。"
-            else:
-                links = interactive.BUY_LINKS
-                text = "【买入】点指令链，把 100 改成你要的数量再发送。"
-            yield self._panel(event, cfg, text, [interactive.NAV_BUTTONS], links)
+            async for result in self._pick_panel(event, cfg, namespace, user, act):
+                yield result
+            return
+
+        if act.startswith(("qbuy", "qsell")):
+            async for result in self._ask_order(event, cfg, namespace, user, act, data):
+                yield result
+            return
+
+        if act == "confirm_order":
+            async for result in self._do_order(event, namespace, cfg, user, data):
+                yield result
+            return
+
+        if act == "pick":
+            async for result in self._stock_panel(
+                event, cfg, namespace, user, str(data.get("code") or "")
+            ):
+                yield result
             return
 
         if act in ("limitbuy", "limitsell"):
@@ -1354,6 +1362,144 @@ class StockMarketPlugin(Star):
         if act == "cancel":
             yield event.plain_result("已取消。")
             return
+
+    async def _pick_panel(self, event, cfg, namespace, user, side: str):
+        """选品种：持仓优先，再补行情里的品种。"""
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            acc = engine.require_account(state, user)
+            held = [
+                code
+                for code, pos in (acc.get("positions") or {}).items()
+                if int(pos.get("shares", 0)) > 0
+            ]
+            codes = held[:5]
+            for code in sorted(state["stocks"]):
+                if len(codes) >= 10:
+                    break
+                if code not in codes:
+                    codes.append(code)
+            names = {c: engine.display_name(s) for c, s in state["stocks"].items()}
+
+        rows = interactive.pick_rows(codes, names, side)
+        rows.append([{"id": "stock:home", "label": "返回"}])
+        title = "买入" if side == "buy" else "卖出"
+        yield self._panel(
+            event,
+            cfg,
+            f"【{title}】点品种 → 选数量 → 确认成交。",
+            rows,
+        )
+
+    async def _stock_panel(self, event, cfg, namespace, user, code: str):
+        """单个品种的现价 + 快捷下单按钮。"""
+        if not code:
+            yield event.plain_result("这个按钮没带品种信息，请从行情页重新点一次。")
+            return
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            stock = engine.find_stock(state, code)
+            unit = engine.unit_label(stock)
+            price_text = engine.fmt_price(stock, int(stock["price"]))
+            pct = engine.stock_pct(stock)
+            label = engine.display_label(stock)
+        yield self._panel(
+            event,
+            cfg,
+            f"{label} · 现价 {price_text} 元/{unit} {engine.fmt_pct(pct)}\n"
+            "点数量按钮 → 确认后成交。",
+            [interactive.stock_trade_row(code)],
+        )
+
+    async def _ask_order(self, event, cfg, namespace, user, act: str, data: dict):
+        """数量按钮 → 确认面板（显示预计金额，资金/持仓不足直接拦下）。"""
+        side = "buy" if act.startswith("qbuy") else "sell"
+        code = str(data.get("code") or "")
+        try:
+            shares = int(data.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0
+        if not code:
+            yield event.plain_result("这个按钮没带品种信息，请重新点一次。")
+            return
+
+        async with self._session(namespace, cfg) as state:
+            state = self._require(state)
+            stock = engine.find_stock(state, code)
+            acc = engine.require_account(state, user)
+            unit = engine.unit_label(stock)
+            price = int(stock["price"])
+            price_text = engine.fmt_price(stock, price)
+            label = engine.display_label(stock)
+            if side == "sell" and shares <= 0:
+                pos = engine.position_of(acc, stock["code"])
+                shares = int(pos["shares"]) if pos else 0
+            amount = engine.value_cents(stock, price, shares) if shares > 0 else 0
+            fee = engine.calc_fee(amount, cfg)
+            cash = int(acc.get("cash", 0))
+            held = 0
+            pos = engine.position_of(acc, stock["code"])
+            if pos:
+                held = int(pos["shares"]) - int(pos.get("frozen", 0))
+
+        if shares <= 0:
+            yield event.plain_result("这个持仓已经不在了。")
+            return
+        if side == "sell" and shares > held:
+            yield event.plain_result(f"可卖数量不足：当前可卖 {held} {unit}。")
+            return
+        if side == "buy" and cash < amount + fee:
+            yield event.plain_result(
+                f"可用资金不足：需要 {engine.fmt_money(amount + fee)} 元，"
+                f"当前可用 {engine.fmt_money(cash)} 元。"
+            )
+            return
+
+        if side == "buy":
+            cost_text = f"预计支出 {engine.fmt_money(amount + fee)} 元（含手续费 {engine.fmt_money(fee)} 元）"
+        else:
+            cost_text = f"预计到账 {engine.fmt_money(amount - fee)} 元（扣手续费 {engine.fmt_money(fee)} 元）"
+
+        rows = [
+            [
+                {
+                    "id": "stock:confirm_order",
+                    "label": "确认成交",
+                    "style": "danger" if side == "sell" else "primary",
+                    "data": {"code": code, "side": side, "shares": shares},
+                },
+                {"id": "stock:cancel", "label": "取消"},
+            ]
+        ]
+        yield self._panel(
+            event,
+            cfg,
+            f"【确认{'买入' if side == 'buy' else '卖出'}】{label} {shares} {unit}\n"
+            f"现价 {price_text} 元 · {cost_text}",
+            rows,
+        )
+
+    async def _do_order(self, event, namespace, cfg, user, data: dict):
+        """确认后真正下单：复用买入/卖出指令的结算与文案。"""
+        code = str(data.get("code") or "")
+        side = str(data.get("side") or "buy")
+        try:
+            shares = int(data.get("shares") or 0)
+        except (TypeError, ValueError):
+            shares = 0
+        if not code or shares <= 0:
+            yield event.plain_result("订单参数不完整，请重新点一次。")
+            return
+        try:
+            if side == "sell":
+                result = await self._cmd_sell(event, namespace, cfg, [code, str(shares)])
+            else:
+                result = await self._cmd_buy(event, namespace, cfg, [code, str(shares)])
+        except MarketError as exc:
+            yield event.plain_result(f"❌ {exc}")
+            return
+        if result is not None:
+            yield result
 
     async def _position_links(self, event, namespace, cfg, user):
         """把用户当前持仓做成卖出指令链（最多 5 条）。"""

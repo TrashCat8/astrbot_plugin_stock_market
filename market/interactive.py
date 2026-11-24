@@ -160,14 +160,51 @@ PLAY_ROWS: tuple[tuple[dict[str, Any], ...], ...] = (
     ),
 )
 
-# 单个品种的操作面板
+# 单个品种的操作面板：直接下单（点一次 → 确认 → 成交）
 STOCK_BUTTONS: tuple[dict[str, Any], ...] = (
-    {"id": "stock:buy", "label": "买入", "style": "primary"},
-    {"id": "stock:sell", "label": "卖出", "style": "danger"},
-    {"id": "stock:limitbuy", "label": "挂买单"},
-    {"id": "stock:chart", "label": "走势"},
+    {"id": "stock:qbuy:100", "label": "买100", "style": "primary", "shares": 100},
+    {"id": "stock:qbuy:500", "label": "买500", "shares": 500},
+    {"id": "stock:qsell:100", "label": "卖100", "style": "danger", "shares": 100},
+    {"id": "stock:qsell:all", "label": "卖全部", "style": "danger"},
     {"id": "stock:home", "label": "返回"},
 )
+
+
+def stock_trade_row(code: str) -> list[dict[str, Any]]:
+    """某个品种的快捷下单行（data 带上代码与数量）。"""
+    out: list[dict[str, Any]] = []
+    for spec in STOCK_BUTTONS:
+        item = {k: v for k, v in spec.items() if k not in ("shares", "data")}
+        if spec["id"].startswith(("stock:qbuy", "stock:qsell")):
+            data = {"code": code}
+            if "shares" in spec:
+                data["shares"] = spec["shares"]
+            item["data"] = data
+        out.append(item)
+    return out
+
+
+def pick_rows(codes: list[str], names: dict[str, str], side: str = "buy") -> list[list[dict[str, Any]]]:
+    """品种选择按钮：点一个进入该品种的下单面板（最多 2 行 × 5 个）。"""
+    prefix = "买" if side == "buy" else "卖"
+    buttons = []
+    for index, code in enumerate(codes[:10]):
+        raw = names.get(code) or code
+        name = raw.split("/")[0][:4] if "/" in raw else raw[:4]
+        buttons.append(
+            {
+                "id": f"stock:pick:{index}",
+                "label": f"{prefix}{name}",
+                "data": {"code": code},
+                "style": "primary" if side == "buy" else "danger",
+            }
+        )
+    if not buttons:
+        return []
+    rows = [buttons[:5]]
+    if len(buttons) > 5:
+        rows.append(buttons[5:10])
+    return rows
 
 # 卖出确认
 CONFIRM_BUTTONS: tuple[dict[str, Any], ...] = (
