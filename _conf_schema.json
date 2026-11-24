@@ -1,4 +1,10 @@
 {
+  "broke_broadcast": {
+    "description": "资产清零播报",
+    "type": "bool",
+    "default": true,
+    "hint": "某人净资产（可用 + 冻结 + 持仓市值 − 欠款）跌到 ≤ 0 时，在群里播报「💥 昵称 空中飞人了」。每人只播一次，净值回正后再次爆仓会再播。"
+  },
   "interactive_buttons": {
     "description": "卡片附带可点击按钮",
     "type": "bool",

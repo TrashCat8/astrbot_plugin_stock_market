@@ -1164,6 +1164,34 @@ def account_net(state: dict[str, Any], acc: dict[str, Any]) -> int:
     return account_total(state, acc) - int(acc.get("debt", 0))
 
 
+def detect_broke(state: dict[str, Any]) -> list[dict[str, Any]]:
+    """净资产 ≤ 0 的人，返回本次新触发播报的名单。
+
+    每人只播一次：`broke` 标记落盘，净值回正后自动重置，之后再爆仓还能再播。
+    """
+    alerts: list[dict[str, Any]] = []
+    for user, acc in (state.get("accounts") or {}).items():
+        try:
+            net = account_net(state, acc)
+        except (TypeError, ValueError):
+            continue
+        if net > 0:
+            if acc.get("broke"):
+                acc["broke"] = False
+            continue
+        if acc.get("broke"):
+            continue
+        acc["broke"] = True
+        alerts.append(
+            {
+                "user": user,
+                "name": str(acc.get("name") or user),
+                "net": net,
+            }
+        )
+    return alerts
+
+
 def _credit(acc: dict[str, Any], amount: int) -> int:
     """入账：有杠杆欠款时优先还债，剩下的才进可用资金。返回本次还掉的金额。"""
     amount = max(0, int(amount))

@@ -69,6 +69,7 @@ class Config:
     # 消息交互：卡片后附按钮（keyboard）/ 正文附可点文字指令链
     interactive_buttons: bool = True
     text_chain: bool = True
+    broke_broadcast: bool = True
 
     @property
     def order_ttl_rounds(self) -> int:
@@ -168,4 +169,5 @@ class Config:
             instruments=instruments,
             interactive_buttons=bool(cfg.get("interactive_buttons", True)),
             text_chain=bool(cfg.get("text_chain", True)),
+            broke_broadcast=bool(cfg.get("broke_broadcast", True)),
         )

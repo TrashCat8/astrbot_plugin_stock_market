@@ -62,6 +62,9 @@
 - 买卖手续费各 `fee_rate`（默认 0.1%），按成交额向上取整到分，成本里包含买入手续费。
 - 限价单达到限价时按**当时市价**成交（可能优于限价），冻结差额自动退回；到期未成交自动撤销。
 - 价格上涨显示红色、下跌显示绿色，与 A 股习惯一致。
+- **资产清零播报**：某人净资产（可用 + 冻结 + 持仓市值 − 欠款）跌到 ≤ 0 时，群里会播报
+  `💥 昵称 空中飞人了！净资产 0.00 元`。每人只播一次，净值回正后再次爆仓会重新播；
+  优先主动发群消息，发不出去时随当前指令的回复带出。配置项 `broke_broadcast` 可关。
 
 ### 玩法规则
 
@@ -90,7 +93,7 @@
 - 股票名称：`data/plugin_data/astrbot_plugin_stock_market/names.json`（**所有群共用**，`/股市 改名` 后各群下一次指令即生效；价格、账户、挂单、新闻仍按群独立）
 - 渲染缓存：`data/plugin_data/astrbot_plugin_stock_market/cache/`（自动清理）
 - 可选背景图：把 `bg.jpg` / `bg.png` 放进插件目录的 `assets/`，卡片会自动叠加。
-- 配置项见 `_conf_schema.json`，可在 AstrBot 的插件配置页直接改。真实行情相关：`data_source`（real / simulated）、`refresh_seconds`、`alert_moves_pct`、`symbols`、`fx_enabled`、`fx_pairs`、`quote_timeout`；消息交互相关：`interactive_buttons`、`text_chain`。
+- 配置项见 `_conf_schema.json`，可在 AstrBot 的插件配置页直接改。真实行情相关：`data_source`（real / simulated）、`refresh_seconds`、`alert_moves_pct`、`symbols`、`fx_enabled`、`fx_pairs`、`quote_timeout`；消息交互相关：`interactive_buttons`、`text_chain`、`broke_broadcast`。
 
 ## AI 辅助创作说明
 
@@ -117,6 +120,7 @@ python tests/test_interactive.py  # 消息交互 9 项（按钮规格 / 指令�
 
 ## 更新日志
 
+- **1.8.1**（2026-11-24）：新增「资产清零播报」——某人净资产 ≤0 时群内播报「💥 昵称 空中飞人了」，每人一次、回正后可再播，主动发送失败时随指令回复兜底；配置项 `broke_broadcast`。
 - **1.8.0**（2026-11-24）：全面按钮化：一级导航（行情/汇市/持仓/交易/玩法）、交易面板（买卖/挂单/融资/杠杆/还债/成交）、玩法面板（签到/补助/排行/盈亏/异动/db/抢劫/转账）、品种详情按钮、持仓页「卖①…卖⑤」二次确认卖出；参数类操作统一走可点指令链。`filter.button_action` 改为单入口按 action_id 路由。
 - **1.7.2**（2026-11-24）：内置 Noto Sans SC 子集字体（`assets/fonts/`），修容器里卡片中文变方框的问题；字体查找顺序改为插件自带优先，补 wqy 系列路径，找不到字体时日志告警。
 - **1.7.1**（2026-11-24）：修排行榜大额列重叠、emoji 昵称豆腐块、持仓卡过长（每页 6 行分页，`/股市 持仓 [页码]` 生效）、首次报价污染区间、走势卡文案、挂单剩余时间改小时/分钟；`quote_page` 补 `price_scale`。

@@ -14,6 +14,11 @@ from typing import Any, AsyncIterator
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
+
+try:  # 主动播报要用 MessageChain；老版本没有时退回随指令回复
+    from astrbot.api.event import MessageChain
+except Exception:  # pragma: no cover
+    MessageChain = None
 from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
@@ -266,6 +271,19 @@ class StockMarketPlugin(Star):
     # ------------------------------------------------------------------ #
 
     @staticmethod
+    def _umo(event: AstrMessageEvent) -> str:
+        value = getattr(event, "unified_msg_origin", None)
+        if value:
+            return str(value)
+        getter = getattr(event, "get_unified_msg_origin", None)
+        if callable(getter):
+            try:
+                return str(getter() or "")
+            except Exception:
+                pass
+        return str(getattr(event, "session_id", "") or "")
+
+    @staticmethod
     def _platform_label(event: AstrMessageEvent) -> str:
         parts: list[str] = []
         for name in ("get_platform_name", "get_platform_id"):
@@ -402,9 +420,47 @@ class StockMarketPlugin(Star):
             if item is not None:
                 yield item
 
+        # 本条指令可能把某人净值打到 ≤0：群内播报一次
+        for line in await self._notify_broke(event, cfg, namespace):
+            yield event.plain_result(line)
+
     # ------------------------------------------------------------------ #
     # 各子指令
     # ------------------------------------------------------------------ #
+
+    async def _notify_broke(self, event, cfg: Config, namespace: str) -> list[str]:
+        """检测净资产归零的人，返回需要随指令回复的兜底文案（主动发送成功则为空）。"""
+        if not cfg.broke_broadcast:
+            return []
+        async with self.store.lock(namespace):
+            state = self.store.load(namespace)
+            if state is None:
+                return []
+            alerts = engine.detect_broke(state)
+            if not alerts:
+                return []
+            self.store.save(namespace, state)
+
+        texts = [
+            f"💥 {alert['name']} 空中飞人了！净资产 {engine.fmt_money(alert['net'])} 元"
+            for alert in alerts
+        ]
+        umo = self._umo(event)
+        if (
+            self.context is not None
+            and umo
+            and MessageChain is not None
+            and interactive.Plain is not None
+        ):
+            try:
+                for text in texts:
+                    await self.context.send_message(
+                        umo, MessageChain([interactive.Plain(text)])
+                    )
+                return []
+            except Exception:
+                logger.warning("[stock] 破产播报主动发送失败，改为随指令回复")
+        return texts
 
     async def _cmd_open(self, event, namespace, cfg, rest):
         user = self._user(event)
