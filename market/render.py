@@ -173,7 +173,8 @@ def _pct_color(pct: float) -> tuple[int, int, int]:
     return MUTED
 
 
-def _save(img: Image.Image, out: Path) -> Path:
+def _save(img: Image.Image, out: Path | str) -> Path:
+    out = Path(out)
     out.parent.mkdir(parents=True, exist_ok=True)
     img.convert("RGB").save(out, "PNG", optimize=True)
     return out
