@@ -23,7 +23,7 @@ from astrbot.api.star import Context, Star
 from astrbot.core.star.filter.command import GreedyStr
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from .market import engine, interactive, render, textfmt
+from .market import engine, instruments, interactive, render, textfmt
 from .market.config import Config
 from .market.engine import MarketError
 from .market.feeds import QuoteFeed
@@ -229,19 +229,51 @@ class StockMarketPlugin(Star):
             if state is None and create:
                 state = engine.new_state(namespace, time.time(), cfg)
             if state is not None:
-                quotes = None
-                if cfg.data_source == "real" and cfg.instruments:
-                    # 行情抓取失败时 feeds 会退回上一帧，交易不受影响
-                    quotes = await self.feed.snapshot(cfg.instruments, cfg.refresh_seconds)
                 engine.ensure_instruments(state, cfg)
                 # 股票名称是全局的，每次进群先套用最新的名称表
                 self.names.apply(state)
+                quotes = None
+                if cfg.data_source == "real":
+                    # 只监测账本里的品种（默认池 + 群友真正买过/查过的），不拉全市场
+                    watch = engine.instruments_of(state)
+                    if watch:
+                        quotes = await self.feed.snapshot(watch, cfg.refresh_seconds)
                 engine.advance(state, time.time(), cfg, quotes=quotes)
             try:
                 yield state
             finally:
                 if state is not None:
                     self.store.save(namespace, state)
+
+    async def _ensure_stock(
+        self, state: dict[str, Any], text: str, cfg: Config
+    ) -> dict[str, Any]:
+        """找到品种；不在账本里就解析代码、加进账本并立刻拉一次真实报价。
+
+        全市场品种按需加入，但必须拿到真实报价才允许交易——参考价只用于占位，
+        不能用来成交，否则新品种会以 1 分钱的价格被买走。
+        """
+        try:
+            return engine.find_stock(state, text)
+        except MarketError:
+            pass
+
+        raw = str(text or "").strip()
+        if cfg.data_source != "real":
+            raise MarketError(f"没有找到品种「{raw}」，模拟模式只支持内置品种。")
+        inst = instruments.resolve(raw)
+        if inst is None:
+            raise MarketError(
+                f"没有找到「{raw}」。股票用代码（sh601988、sz300750、hk00700、usAAPL），"
+                "指数可用「上证」「纳指」「恒生」等。"
+            )
+        stock = engine.add_instrument(state, inst)
+        quotes = await self.feed.snapshot([inst], 0)
+        if not quotes.get(inst.code):
+            state.get("stocks", {}).pop(inst.code, None)
+            raise MarketError(f"暂时拿不到「{raw}」的行情，稍后再试。")
+        engine.apply_quotes(state, quotes, time.time(), cfg)
+        return stock
 
     @staticmethod
     def _require(state: dict[str, Any] | None) -> dict[str, Any]:
@@ -493,7 +525,7 @@ class StockMarketPlugin(Star):
             engine.require_account(state, user)
 
             if arg and not arg.isdigit():
-                stock = engine.find_stock(state, arg)
+                stock = await self._ensure_stock(state, arg, cfg)
                 detail = self._detail_text(stock, cfg, int(state["round"]))
                 return self._interactive(
                     event,
@@ -640,7 +672,8 @@ class StockMarketPlugin(Star):
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             self._mark_name(event, state, user)
-            trade = engine.buy(state, user, rest[0], rest[1], cfg)
+            stock = await self._ensure_stock(state, rest[0], cfg)
+            trade = engine.buy(state, user, stock["code"], rest[1], cfg)
             notes = engine.pop_notices(engine.require_account(state, user))
         lines = [
             *notes,
@@ -658,7 +691,8 @@ class StockMarketPlugin(Star):
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             self._mark_name(event, state, user)
-            trade = engine.sell(state, user, rest[0], rest[1], cfg)
+            stock = await self._ensure_stock(state, rest[0], cfg)
+            trade = engine.sell(state, user, stock["code"], rest[1], cfg)
             notes = engine.pop_notices(engine.require_account(state, user))
         lines = [
             *notes,
@@ -682,7 +716,10 @@ class StockMarketPlugin(Star):
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
             self._mark_name(event, state, user)
-            trade = engine.leverage_buy(state, user, rest[0], rest[1], rest[2], cfg)
+            stock = await self._ensure_stock(state, rest[0], cfg)
+            trade = engine.leverage_buy(
+                state, user, stock["code"], rest[1], rest[2], cfg
+            )
             notes = engine.pop_notices(engine.require_account(state, user))
         lines = [
             *notes,
@@ -762,7 +799,10 @@ class StockMarketPlugin(Star):
         user = self._user(event)
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
-            result = engine.place_order(state, user, side, rest[0], rest[1], rest[2], cfg)
+            stock = await self._ensure_stock(state, rest[0], cfg)
+            result = engine.place_order(
+                state, user, side, stock["code"], rest[1], rest[2], cfg
+            )
             order = dict(result["order"])
             stock = result["stock"]
             executed_at = result["executed_at"]
@@ -875,7 +915,7 @@ class StockMarketPlugin(Star):
         text_only = self._is_button_event(event)
         async with self._session(namespace, cfg) as state:
             state = self._require(state)
-            stock = engine.find_stock(state, rest[0])
+            stock = await self._ensure_stock(state, rest[0], cfg)
             snapshot = {
                 "code": stock["code"],
                 "name": stock.get("name") or "",
@@ -1374,12 +1414,21 @@ class StockMarketPlugin(Star):
                 for code, pos in (acc.get("positions") or {}).items()
                 if int(pos.get("shares", 0)) > 0
             ]
+            # 按钮面板固定 11 个：先放群友持仓，再补默认股票池；其它股票/指数用自然语言买
+            defaults = [inst.code for inst in cfg.instruments if inst.kind == "stock"][:11]
+            if not defaults:  # 模拟模式没有配置池，退回账本里的股票
+                defaults = [
+                    code
+                    for code, stock in state["stocks"].items()
+                    if (stock.get("kind") or "stock") == "stock"
+                ][:11]
             codes = held[:5]
-            for code in sorted(state["stocks"]):
-                if len(codes) >= 10:
+            for code in defaults:
+                if len(codes) >= 11:
                     break
-                if code not in codes:
+                if code not in codes and code in state["stocks"]:
                     codes.append(code)
+            codes = codes[:11]
             names = {c: engine.display_name(s) for c, s in state["stocks"].items()}
 
         rows = interactive.pick_rows(codes, names, side)
@@ -1658,7 +1707,7 @@ class StockMarketPlugin(Star):
                     state = self._require(state)
                     engine.require_account(state, self._user(event))
                     if keyword.strip():
-                        stock = engine.find_stock(state, keyword.strip())
+                        stock = await self._ensure_stock(state, keyword.strip(), cfg)
                         return self._detail_text(stock, cfg, int(state["round"]))
                     kind = {"fx": "fx", "all": None}.get(market.strip().lower(), "stock")
                     try:

@@ -188,9 +188,11 @@ def pick_rows(codes: list[str], names: dict[str, str], side: str = "buy") -> lis
     """品种选择按钮：点一个进入该品种的下单面板（最多 2 行 × 5 个）。"""
     prefix = "买" if side == "buy" else "卖"
     buttons = []
-    for index, code in enumerate(codes[:10]):
+    for index, code in enumerate(codes[:11]):
         raw = names.get(code) or code
-        name = raw.split("/")[0][:4] if "/" in raw else raw[:4]
+        if "/" in raw:
+            raw = raw.split("/")[0]
+        name = raw if len(raw) <= 5 else raw[:4]
         buttons.append(
             {
                 "id": f"stock:pick:{index}",
@@ -204,6 +206,8 @@ def pick_rows(codes: list[str], names: dict[str, str], side: str = "buy") -> lis
     rows = [buttons[:5]]
     if len(buttons) > 5:
         rows.append(buttons[5:10])
+    if len(buttons) > 10:
+        rows.append(buttons[10:11])
     return rows
 
 # 卖出确认

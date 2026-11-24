@@ -19,7 +19,7 @@ from typing import Any
 
 from . import news as news_mod
 from .config import Config
-from .instruments import SCALE_STOCK
+from .instruments import SCALE_STOCK, Instrument
 from .seeds import SEED_STOCKS
 
 MAX_HISTORY = 240
@@ -67,7 +67,12 @@ def value_cents(stock: dict[str, Any] | None, price: int, units: int) -> int:
 
 
 def unit_label(stock: dict[str, Any] | None) -> str:
-    return "单位" if (stock or {}).get("kind") == "fx" else "股"
+    kind = (stock or {}).get("kind")
+    if kind == "fx":
+        return "单位"
+    if kind == "index":
+        return "张"
+    return "股"
 
 
 def currency_of(stock: dict[str, Any] | None) -> str:
@@ -113,6 +118,7 @@ def new_state(group: str, now: float, cfg: Config) -> dict[str, Any]:
                 "code": inst.code,
                 "name": inst.name,
                 "kind": inst.kind,
+                "provider": inst.provider,
                 "symbol": inst.symbol,
                 "sector": inst.sector,
                 "currency": inst.currency,
@@ -162,10 +168,14 @@ def ensure_instruments(state: dict[str, Any], cfg: Config) -> int:
         return 0
     wanted = {inst.code: inst for inst in cfg.instruments}
     closed = 0
+    seed_codes = {item["code"] for item in SEED_STOCKS}
+    # 只清理模拟时代的种子与没有行情来源的条目；用户后来买入的品种要保留
     for code in list(state.get("stocks", {})):
         if code in wanted:
             continue
         stock = state["stocks"][code]
+        if code not in seed_codes and stock.get("symbol"):
+            continue
         closed += _close_out(state, stock)
         state["stocks"].pop(code, None)
 
@@ -177,6 +187,7 @@ def ensure_instruments(state: dict[str, Any], cfg: Config) -> int:
                 "code": code,
                 "name": inst.name,
                 "kind": inst.kind,
+                "provider": inst.provider,
                 "symbol": inst.symbol,
                 "sector": inst.sector,
                 "currency": inst.currency,
@@ -188,6 +199,7 @@ def ensure_instruments(state: dict[str, Any], cfg: Config) -> int:
             }
             continue
         stock["kind"] = inst.kind
+        stock["provider"] = inst.provider
         stock["symbol"] = inst.symbol
         stock["sector"] = inst.sector
         stock["currency"] = inst.currency
@@ -237,6 +249,55 @@ def _close_out(state: dict[str, Any], stock: dict[str, Any]) -> int:
             holders += 1
         acc["positions"].pop(code, None)
     return holders
+
+
+def add_instrument(state: dict[str, Any], inst: Instrument) -> dict[str, Any]:
+    """把新品种加进账本（买了/查了才加），价格先给参考价，随后由行情覆盖。"""
+    code = inst.code
+    existing = (state.get("stocks") or {}).get(code)
+    if existing is not None:
+        return existing
+    price = max(1, int(round(float(inst.ref_price or 1.0) * inst.price_scale)))
+    stock = {
+        "code": code,
+        "name": inst.name,
+        "kind": inst.kind,
+        "provider": inst.provider,
+        "symbol": inst.symbol,
+        "sector": inst.sector,
+        "currency": inst.currency,
+        "price_scale": inst.price_scale,
+        "price_digits": inst.price_digits,
+        "price": price,
+        "prev": price,
+        "history": [[int(state.get("round", 0)), price]],
+    }
+    state.setdefault("stocks", {})[code] = stock
+    return stock
+
+
+def instruments_of(state: dict[str, Any]) -> list[Instrument]:
+    """账本里当前需要监测的品种（只请求这些，不碰全市场）。"""
+    out: list[Instrument] = []
+    for code, stock in (state.get("stocks") or {}).items():
+        symbol = str(stock.get("symbol") or "").strip()
+        if not symbol:
+            continue
+        kind = stock.get("kind") or "stock"
+        out.append(
+            Instrument(
+                code=code,
+                name=str(stock.get("name") or ""),
+                kind=kind,
+                provider=str(stock.get("provider") or ("sina_fx" if kind == "fx" else "tencent")),
+                symbol=symbol,
+                sector=str(stock.get("sector") or ""),
+                price_scale=price_scale(stock),
+                price_digits=price_digits(stock),
+                currency=currency_of(stock),
+            )
+        )
+    return out
 
 
 def advance(

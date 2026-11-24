@@ -18,6 +18,9 @@ from typing import Any
 SCALE_STOCK = 100
 SCALE_FX = 1_000_000
 
+# 主要指数：行情接口按点位给，交易单位叫「张」，默认不进账本，买了/查了才加入
+INDEXES: tuple[Instrument, ...] = ()  # 占位，定义在 Instrument 之后
+
 FX_NAMES = {
     "USD": "美元",
     "EUR": "欧元",
@@ -79,6 +82,84 @@ _FX_REF = {
 }
 
 
+INDEX_SPECS: tuple[tuple[str, str, str, str], ...] = (
+    ("IDX000001", "上证指数", "sh000001", "A股指数"),
+    ("IDX399001", "深证成指", "sz399001", "A股指数"),
+    ("IDX399006", "创业板指", "sz399006", "A股指数"),
+    ("IDX000300", "沪深300", "sh000300", "A股指数"),
+    ("IDX000905", "中证500", "sh000905", "A股指数"),
+    ("IDX000016", "上证50", "sh000016", "A股指数"),
+    ("IDX000688", "科创50", "sh000688", "A股指数"),
+    ("IDXHSI", "恒生指数", "hkHSI", "港股指数"),
+    ("IDXHSCEI", "恒生国企", "hkHSCEI", "港股指数"),
+    ("IDXIXIC", "纳斯达克", "usIXIC", "美股指数"),
+    ("IDXDJI", "道琼斯", "usDJI", "美股指数"),
+    ("IDXINX", "标普500", "usINX", "美股指数"),
+)
+
+INDEXES = tuple(
+    Instrument(
+        code=code,
+        name=name,
+        kind="index",
+        provider="tencent",
+        symbol=symbol,
+        sector=sector,
+        price_scale=SCALE_STOCK,
+        price_digits=2,
+        currency="CNY" if symbol[:2] in ("sh", "sz") else ("HKD" if symbol.startswith("hk") else "USD"),
+    )
+    for code, name, symbol, sector in INDEX_SPECS
+)
+
+# 中文别名 → 内部代码
+ALIASES: dict[str, str] = {
+    "上证": "IDX000001",
+    "上证指数": "IDX000001",
+    "大盘": "IDX000001",
+    "深成指": "IDX399001",
+    "深证": "IDX399001",
+    "深证成指": "IDX399001",
+    "创业板": "IDX399006",
+    "创业板指": "IDX399006",
+    "沪深300": "IDX000300",
+    "中证500": "IDX000905",
+    "上证50": "IDX000016",
+    "科创50": "IDX000688",
+    "恒生": "IDXHSI",
+    "恒指": "IDXHSI",
+    "恒生指数": "IDXHSI",
+    "国企指数": "IDXHSCEI",
+    "纳指": "IDXIXIC",
+    "纳斯达克": "IDXIXIC",
+    "道指": "IDXDJI",
+    "道琼斯": "IDXDJI",
+    "标普": "IDXINX",
+    "标普500": "IDXINX",
+    "茅台": "SH600519",
+    "贵州茅台": "SH600519",
+    "平安银行": "SZ000001",
+    "中国平安": "SH601318",
+    "宁德时代": "SZ300750",
+    "招商银行": "SH600036",
+    "招行": "SH600036",
+    "比亚迪": "SZ002594",
+    "腾讯": "HK00700",
+    "腾讯控股": "HK00700",
+    "阿里": "HK09988",
+    "阿里巴巴": "HK09988",
+    "苹果": "US_AAPL",
+    "英伟达": "US_NVDA",
+    "特斯拉": "US_TSLA",
+    "美元": "FX_USDCNY",
+    "欧元": "FX_EURCNY",
+    "日元": "FX_JPYCNY",
+    "港元": "FX_HKDCNY",
+    "英镑": "FX_GBPCNY",
+    "澳元": "FX_AUDCNY",
+}
+
+
 def fx_instrument(currency: str) -> Instrument:
     cur = currency.strip().upper()
     if cur not in FX_NAMES:
@@ -95,6 +176,55 @@ def fx_instrument(currency: str) -> Instrument:
         currency="CNY",
         ref_price=_FX_REF.get(cur, 1.0),
     )
+
+
+def normalize_symbol(text: str) -> str | None:
+    """把 600519 / 000001 / 00700 / AAPL 这类输入补齐成行情代码。"""
+    raw = (text or "").strip().lower()
+    if not raw:
+        return None
+    if raw[:2] in ("sh", "sz", "hk", "us"):
+        return raw
+    if raw.isdigit() and len(raw) == 6:
+        if raw[:2] in ("60", "68", "11", "51"):
+            return "sh" + raw
+        if raw[:2] in ("00", "30", "12", "15"):
+            return "sz" + raw
+        return "sh" + raw
+    if raw.isdigit() and len(raw) == 5:
+        return "hk" + raw
+    if raw.isascii() and raw.isalpha() and len(raw) <= 6:
+        return "us" + raw
+    return None
+
+
+def resolve(text: str) -> Instrument | None:
+    """把用户输入（代码 / 名称 / 指数别名 / 裸数字）解析成品种；解析不了返回 None。"""
+    key = (text or "").strip()
+    if not key:
+        return None
+    upper = key.upper()
+    known = {inst.code: inst for inst in (DEFAULT_STOCKS + INDEXES)}
+    for cur in FX_NAMES:
+        inst = fx_instrument(cur)
+        known[inst.code] = inst
+        known[inst.code.replace("FX_", "").replace("CNY", "")] = inst
+    if upper in known:
+        return known[upper]
+    lowered = key.lower()
+    for inst in known.values():
+        if inst.symbol and inst.symbol.lower() == lowered:
+            return inst
+    for inst in known.values():
+        if inst.name and inst.name == key:
+            return inst
+    alias = ALIASES.get(key) or ALIASES.get(upper)
+    if alias and alias.upper() in known:
+        return known[alias.upper()]
+    symbol = normalize_symbol(key)
+    if symbol:
+        return stock_instrument(symbol)
+    return None
 
 
 def stock_instrument(symbol: str, name: str = "", sector: str = "") -> Instrument:
@@ -115,7 +245,7 @@ def stock_instrument(symbol: str, name: str = "", sector: str = "") -> Instrumen
         raise ValueError(f"无法识别的行情代码：{raw}（支持 sh/sz/hk/us 前缀）")
     return Instrument(
         code=code,
-        name=name or raw.upper(),
+        name=name,
         kind="stock",
         provider="tencent",
         symbol=low,
